@@ -2,9 +2,6 @@ package engine
 
 import "sync"
 
-// MutexMap is the simplest possible concurrency-safe key-value store: one
-// map guarded by one mutex. It's the M1 baseline that ShardedMap is
-// benchmarked against.
 type MutexMap struct {
 	mu   sync.Mutex
 	data map[string][]byte
