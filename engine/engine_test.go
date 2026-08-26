@@ -92,3 +92,15 @@ func TestMutexMapCopySemantics(t *testing.T) {
 func TestMutexMapConcurrent(t *testing.T) {
 	testEngineConcurrent(t, NewMutexMap())
 }
+
+func TestShardedMapBasic(t *testing.T) {
+	testEngineBasic(t, NewShardedMap(0))
+}
+
+func TestShardedMapCopySemantics(t *testing.T) {
+	testEngineCopySemantics(t, NewShardedMap(0))
+}
+
+func TestShardedMapConcurrent(t *testing.T) {
+	testEngineConcurrent(t, NewShardedMap(0))
+}
