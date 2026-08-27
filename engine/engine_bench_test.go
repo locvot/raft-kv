@@ -21,6 +21,14 @@ func BenchmarkShardedMap(b *testing.B) {
 	benchmarkEngine(b, NewShardedMap(0))
 }
 
+func BenchmarkRWMutexMap(b *testing.B) {
+	benchmarkEngine(b, NewRWMutexMap())
+}
+
+func BenchmarkRCUShardedMap(b *testing.B) {
+	benchmarkEngine(b, NewRCUShardedMap(0))
+}
+
 func BenchmarkSyncMap(b *testing.B) {
 	benchmarkEngine(b, NewSyncMap())
 }

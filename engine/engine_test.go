@@ -105,6 +105,30 @@ func TestShardedMapConcurrent(t *testing.T) {
 	testEngineConcurrent(t, NewShardedMap(0))
 }
 
+func TestRWMutexMapBasic(t *testing.T) {
+	testEngineBasic(t, NewRWMutexMap())
+}
+
+func TestRWMutexMapCopySemantics(t *testing.T) {
+	testEngineCopySemantics(t, NewRWMutexMap())
+}
+
+func TestRWMutexMapConcurrent(t *testing.T) {
+	testEngineConcurrent(t, NewRWMutexMap())
+}
+
+func TestRCUShardedMapBasic(t *testing.T) {
+	testEngineBasic(t, NewRCUShardedMap(0))
+}
+
+func TestRCUShardedMapCopySemantics(t *testing.T) {
+	testEngineCopySemantics(t, NewRCUShardedMap(0))
+}
+
+func TestRCUShardedMapConcurrent(t *testing.T) {
+	testEngineConcurrent(t, NewRCUShardedMap(0))
+}
+
 func TestSyncMapBasic(t *testing.T) {
 	testEngineBasic(t, NewSyncMap())
 }

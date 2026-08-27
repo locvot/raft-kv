@@ -42,18 +42,32 @@ mini-kv/
 copy semantics (Put copies its input, Get returns a copy — a caller
 mutating either slice can never touch internal state or race with it).
 
-Three implementations to compare the contention/complexity trade-off:
+Five implementations to compare the contention/complexity trade-off:
 
 - **`MutexMap`** — baseline: a single `sync.Mutex` guarding one
   `map[string][]byte`.
 - **`ShardedMap`** — splits the keyspace into 128 shards by default,
   each with its own mutex, routed by FNV-1a hash — cuts lock contention
   under concurrent writes.
+- **`RWMutexMap`** — a single `sync.RWMutex` guarding one map; readers
+  take `RLock`, writers take `Lock`. Beats a plain `Mutex` (concurrent
+  readers no longer serialize), but every `RLock`/`RUnlock` still does an
+  atomic increment/decrement on one shared reader counter — under many
+  cores that counter itself becomes a cache-line-bouncing bottleneck, so
+  it loses badly to `ShardedMap` at every workload tested, including
+  pure reads (see benchmark numbers below).
 - **`SyncMap`** — wraps `sync.Map`. Fast on read-heavy/write-rare
   workloads (exactly the pattern `sync.Map` is optimized for), but
   slower than `ShardedMap` as the fraction of overwrites to existing
   keys grows (every overwrite falls into the internal mutex-guarded
   `dirty` map, losing the lock-free fast path).
+- **`RCUShardedMap`** — read-copy-update per shard: readers do a plain
+  `atomic.Pointer` load (no lock, no shared reader counter to contend
+  on at all, unlike `RWMutexMap`); writers serialize per-shard and pay
+  the cost of copying the *entire shard's map* on every Put/Delete. Ties
+  `ShardedMap` on pure reads (genuinely zero read-side contention), but
+  loses badly as the write fraction grows — the O(shard size) copy per
+  write makes it the slowest of all five once writes dominate.
 
 ### Running tests
 
@@ -86,26 +100,34 @@ Example: write-heavy workload (50/50 Put/Get) with a larger keyspace:
 go test ./engine/... -bench=. -run=^$ -benchmem -keyspace=100000 -valuesize=256 -writepct=50
 ```
 
-**Measured numbers** (Intel i7-11700, default `writepct=10`, keyspace=1000):
+**Measured numbers** (Intel i7-11700, 16 cores, `-count=8` + `benchstat`,
+keyspace=1000):
 
-| Engine | ns/op | B/op | allocs/op |
-|---|---|---|---|
-| MutexMap | 142.5 | 14 | 1 |
-| ShardedMap | 18.74 | 14 | 1 |
-| SyncMap | 18.95 | 23 | 2 |
+| Engine | writepct=0 | writepct=10 | writepct=50 | writepct=90 |
+|---|---|---|---|---|
+| MutexMap | 105.6n | 135.6n | 173.1n | 210.0n |
+| ShardedMap | 17.71n | 24.62n | 29.15n | 31.59n |
+| RWMutexMap | 42.16n | 117.9n | 126.8n | 150.9n |
+| RCUShardedMap | 17.86n | 35.05n | 129.6n | 287.8n |
+| SyncMap | 18.44n | 25.75n | 44.47n | 65.16n |
 
-Same configuration but `writepct=50`:
-
-| Engine | ns/op | B/op | allocs/op |
-|---|---|---|---|
-| MutexMap | 178.9 | 17 | 2 |
-| ShardedMap | 22.87 | 17 | 2 |
-| SyncMap | 33.03 | 62 | 3 |
-
-Takeaway: sharding clearly beats a single mutex at every workload;
-`sync.Map` only competes when reads dominate writes, and does
-noticeably worse once overwrites of existing keys become frequent —
-which matches how a real KV store is actually used.
+Takeaway: sharding clearly beats a single mutex at every workload.
+`RWMutexMap` beats a plain mutex but never catches `ShardedMap` — a CPU
+profile at writepct=0 shows **67.7%** of total CPU time inside
+`sync/atomic.(*Int32).Add`, i.e. the shared reader-count increment on
+every `RLock`/`RUnlock`, which bounces across all 16 cores' caches even
+though nothing is actually being written. `RCUShardedMap` (per-shard
+`atomic.Pointer` copy-on-write) is the mirror image: it *ties*
+`ShardedMap` on pure reads — a CPU profile at writepct=0 shows no
+lock/atomic hotspot at all, just the benchmark's own key-formatting cost
+— because a reader is a single pointer load with no shared mutable state
+to contend on. But every write copies the entire shard's map, so it gets
+worse than `MutexMap` past ~50% writes. `sync.Map` only competes when
+reads dominate writes, and does noticeably worse once overwrites of
+existing keys become frequent — which matches how a real KV store is
+actually used. See [`doc/knowledge.md`](doc/knowledge.md) (Vietnamese)
+for the full methodology, more workloads (keyspace/value-size sweeps),
+and the profiling evidence behind each conclusion.
 
 ### Profiling
 
