@@ -104,3 +104,15 @@ func TestShardedMapCopySemantics(t *testing.T) {
 func TestShardedMapConcurrent(t *testing.T) {
 	testEngineConcurrent(t, NewShardedMap(0))
 }
+
+func TestSyncMapBasic(t *testing.T) {
+	testEngineBasic(t, NewSyncMap())
+}
+
+func TestSyncMapCopySemantics(t *testing.T) {
+	testEngineCopySemantics(t, NewSyncMap())
+}
+
+func TestSyncMapConcurrent(t *testing.T) {
+	testEngineConcurrent(t, NewSyncMap())
+}
