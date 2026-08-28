@@ -25,7 +25,7 @@ const footerSize = 24
 // written. Callers must treat this as a hard error, never as "not found".
 var ErrCorruptBlock = errors.New("storage: corrupt block (checksum mismatch)")
 
-// On-disk format (locked in doc/DECISIONS.md):
+// On-disk format:
 //
 //	file := block* index-block footer
 //	block := crc32(4B) payload
@@ -374,8 +374,7 @@ func (r *SSTableReader) Close() error {
 
 // readAllEntries returns every entry in the table, in ascending key order,
 // tombstones included. Used by compaction, which merges whole tables in
-// memory — a deliberate simplification appropriate at this project's
-// scale (see doc/DECISIONS.md: size-tiered compaction, not leveled).
+// memory.
 func (r *SSTableReader) readAllEntries() ([]sstEntry, error) {
 	var out []sstEntry
 	for i := range r.index {

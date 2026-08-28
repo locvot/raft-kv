@@ -26,10 +26,7 @@ const (
 // for one of their own. A single dedicated goroutine (commitLoop) owns the
 // file — it's the only thing that ever calls f.Write/f.Sync, so callers
 // never need a lock to serialize file access, only a channel to hand off
-// their record. Measured effect: without this, concurrent Append callers
-// were capped at ~1950 ops/sec flat regardless of GOMAXPROCS (every call
-// paid its own ~510µs fsync, fully serialized) — see
-// BenchmarkWALAppendParallel in store_bench_test.go and doc/knowledge.md.
+// their record.
 type WAL struct {
 	f     *os.File
 	reqCh chan walRequest

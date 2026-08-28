@@ -10,7 +10,7 @@ import (
 )
 
 // defaultFlushThreshold is the memtable size (in approximate bytes, see
-// Memtable.size) at which Store flushes it to a new SSTable.
+// SkipListMemtable.size) at which Store flushes it to a new SSTable.
 const defaultFlushThreshold = 4 * 1024 * 1024
 
 // sstHandle is one open, live SSTable: its identity (for the manifest and
@@ -32,7 +32,7 @@ type Store struct {
 	dir      string
 	wal      *WAL
 	walPath  string
-	mem      *Memtable
+	mem      *SkipListMemtable
 	manifest *Manifest
 	sstables []*sstHandle // newest-first by creation Seq, across all tiers
 
@@ -104,7 +104,7 @@ func Open(dir string, flushThreshold int) (*Store, error) {
 	}
 	s.wal = wal
 	s.walPath = walPath
-	s.mem = NewMemtable()
+	s.mem = NewSkipListMemtable()
 
 	s.wg.Add(1)
 	go s.compactionLoop()
@@ -149,7 +149,7 @@ func (s *Store) recoverWAL() error {
 		}
 	}
 
-	mem := NewMemtable()
+	mem := NewSkipListMemtable()
 	for _, p := range matches {
 		entries, err := ReplayWAL(p)
 		if err != nil {
@@ -285,7 +285,7 @@ func (s *Store) write(key string, value []byte, tombstone bool) error {
 // goroutine so the caller's write path isn't blocked on it. The pointer
 // swap itself is synchronous and cheap, which bounds memtable growth even
 // under a fast, sustained write burst.
-func (s *Store) triggerFlush(mem *Memtable) {
+func (s *Store) triggerFlush(mem *SkipListMemtable) {
 	s.mu.Lock()
 	if s.mem != mem {
 		s.mu.Unlock()
@@ -301,7 +301,7 @@ func (s *Store) triggerFlush(mem *Memtable) {
 		return
 	}
 	s.wal, s.walPath = newWAL, newWALPath
-	s.mem = NewMemtable()
+	s.mem = NewSkipListMemtable()
 	s.mu.Unlock()
 
 	s.wg.Add(1)
@@ -329,7 +329,7 @@ func (s *Store) triggerFlush(mem *Memtable) {
 // flushToNewSSTable writes every entry in mem out to a new tier-0 SSTable,
 // commits it to the manifest, opens a reader for it, and makes it visible
 // to Get by prepending it to s.sstables.
-func (s *Store) flushToNewSSTable(mem *Memtable) error {
+func (s *Store) flushToNewSSTable(mem *SkipListMemtable) error {
 	if mem.Size() == 0 {
 		return nil
 	}

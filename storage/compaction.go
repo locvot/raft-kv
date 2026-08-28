@@ -153,9 +153,7 @@ func (s *Store) compactTier(gen int, tables []*sstHandle, groups map[int][]*sstH
 // mergeTables reads every entry out of tables (which must be given
 // newest-first) and returns the deduplicated, ascending-key-order result:
 // for a key present in more than one input, the entry from the newest
-// table wins. This loads every input table fully into memory, which is a
-// deliberate simplification appropriate at this project's scale — see
-// doc/DECISIONS.md on choosing size-tiered over leveled compaction.
+// table wins. This loads every input table fully into memory.
 func mergeTables(tables []*sstHandle, dropTombstones bool) ([]sstEntry, error) {
 	merged := make(map[string]sstEntry)
 	for _, h := range tables {

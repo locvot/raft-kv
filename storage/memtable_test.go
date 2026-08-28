@@ -6,8 +6,20 @@ import (
 	"testing"
 )
 
-func TestMemtableBasic(t *testing.T) {
-	m := NewMemtable()
+// memtableImpl is the common surface exercised by the shared test/bench
+// helpers below, implemented by both Memtable (sorted slice) and
+// SkipListMemtable — so every scenario runs against both without
+// duplicating the test bodies.
+type memtableImpl interface {
+	Put(key string, value []byte)
+	Delete(key string)
+	Get(key string) (value []byte, tombstone, found bool)
+	Size() int
+	Iterate(fn func(key string, value []byte, tombstone bool))
+}
+
+func testMemtableBasic(t *testing.T, m memtableImpl) {
+	t.Helper()
 
 	if _, _, found := m.Get("missing"); found {
 		t.Fatalf("Get(missing) = found, want !found")
@@ -36,8 +48,9 @@ func TestMemtableBasic(t *testing.T) {
 	}
 }
 
-func TestMemtableIterateAscending(t *testing.T) {
-	m := NewMemtable()
+func testMemtableIterateAscending(t *testing.T, m memtableImpl) {
+	t.Helper()
+
 	m.Put("c", []byte("3"))
 	m.Put("a", []byte("1"))
 	m.Put("b", []byte("2"))
@@ -64,8 +77,9 @@ func TestMemtableIterateAscending(t *testing.T) {
 	}
 }
 
-func TestMemtableSizeTracksPutAndOverwrite(t *testing.T) {
-	m := NewMemtable()
+func testMemtableSizeTracksPutAndOverwrite(t *testing.T, m memtableImpl) {
+	t.Helper()
+
 	m.Put("k", []byte("1234")) // 1 + 4 = 5
 	if got := m.Size(); got != 5 {
 		t.Fatalf("Size after one Put = %d, want 5", got)
@@ -76,8 +90,9 @@ func TestMemtableSizeTracksPutAndOverwrite(t *testing.T) {
 	}
 }
 
-func TestMemtableConcurrent(t *testing.T) {
-	m := NewMemtable()
+func testMemtableConcurrent(t *testing.T, m memtableImpl) {
+	t.Helper()
+
 	var wg sync.WaitGroup
 	for i := 0; i < 200; i++ {
 		wg.Add(1)
@@ -96,3 +111,21 @@ func TestMemtableConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestMemtableBasic(t *testing.T) { testMemtableBasic(t, NewMemtable()) }
+func TestMemtableIterateAscending(t *testing.T) {
+	testMemtableIterateAscending(t, NewMemtable())
+}
+func TestMemtableSizeTracksPutAndOverwrite(t *testing.T) {
+	testMemtableSizeTracksPutAndOverwrite(t, NewMemtable())
+}
+func TestMemtableConcurrent(t *testing.T) { testMemtableConcurrent(t, NewMemtable()) }
+
+func TestSkipListMemtableBasic(t *testing.T) { testMemtableBasic(t, NewSkipListMemtable()) }
+func TestSkipListMemtableIterateAscending(t *testing.T) {
+	testMemtableIterateAscending(t, NewSkipListMemtable())
+}
+func TestSkipListMemtableSizeTracksPutAndOverwrite(t *testing.T) {
+	testMemtableSizeTracksPutAndOverwrite(t, NewSkipListMemtable())
+}
+func TestSkipListMemtableConcurrent(t *testing.T) { testMemtableConcurrent(t, NewSkipListMemtable()) }

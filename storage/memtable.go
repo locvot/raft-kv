@@ -5,17 +5,8 @@ import (
 	"sync"
 )
 
-// Memtable is the in-memory, write-buffering front end of a Store: every
-// Put/Delete lands here first (after being made durable via the WAL), and
-// gets flushed out to an SSTable once it grows past a size threshold.
-//
-// Backed by a sorted slice with binary search, not a skip list. A skip
-// list's payoff is lock-free concurrent insertion; here, writes are already
-// serialized behind the WAL's fsync (see Store.Put/Delete), so a single
-// mutex over a sorted slice is simpler to get right and just as fast in
-// practice for this project's scale — matching M1's "measure before
-// optimizing" precedent (see engine/ benchmarks). Revisit with a benchmark
-// if this ever shows up as a bottleneck.
+// Memtable is an in-memory, write-buffering front end for a Store, backed
+// by a sorted slice with binary search.
 type Memtable struct {
 	mu      sync.RWMutex
 	entries []memEntry // kept sorted by Key

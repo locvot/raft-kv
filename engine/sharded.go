@@ -8,12 +8,12 @@ import (
 const defaultShards = 128
 
 type ShardedMap struct {
-	shards    []counterShard
+	shards    []shard
 	numShards uint64
 }
 
-// counterShard holds the actual counters and its protecting mutex
-type counterShard struct {
+// shard holds one bucket's key-value data and its protecting mutex.
+type shard struct {
 	mu   sync.Mutex
 	data map[string][]byte
 }
@@ -24,7 +24,7 @@ func NewShardedMap(numShards int) *ShardedMap {
 	}
 
 	sm := &ShardedMap{
-		shards:    make([]counterShard, numShards),
+		shards:    make([]shard, numShards),
 		numShards: uint64(numShards),
 	}
 
