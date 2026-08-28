@@ -10,7 +10,7 @@ project.
 |---|---|---|
 | M0 | Project skeleton, module layout, `go.work` | ✅ |
 | M1 | Concurrency-safe in-memory engine | ✅ |
-| M2 | Durable storage layer (WAL + minimal LSM) | ⬜ not started (`storage/`) |
+| M2 | Durable storage layer (WAL + minimal LSM) | ✅ |
 | M3 | Core Raft consensus | ⬜ not started (`raft/`) |
 | M4 | 3-node cluster wiring over gRPC | ⬜ not started (`transport/`, `cmd/server`, `cmd/client`) |
 | M5 | Fault-tolerance verification | ⬜ |
@@ -192,6 +192,138 @@ Other measurements worth knowing about:
   ```bash
   go tool pprof -http=:8080 cpu.out
   ```
+
+## Storage (M2)
+
+`storage.Store` is a durable, LSM-style key-value engine, independent of
+`engine.Engine` and of Raft's `simharness/persister` — it stands on its own
+under `storage/`, backed by a real on-disk write path:
+
+- **WAL** (`wal.go`) — every `Put`/`Delete` is appended and fsynced before
+  `Store` touches the memtable or returns to the caller, so an
+  acknowledged write survives a crash even before it's ever flushed.
+- **Memtable** (`memtable.go`) — a mutex-guarded sorted slice (binary
+  search), not a skip list: writes are already serialized behind the WAL's
+  fsync, so a skip list's lock-free-insert advantage doesn't apply here,
+  matching M1's "measure before optimizing" precedent.
+- **SSTable** (`sstable.go`) — the on-disk format locked in
+  [`doc/DECISIONS.md`](doc/DECISIONS.md): `[block]* + index-block +
+  footer`, each block prefixed with a CRC32 checksum. A corrupted block is
+  reported as `storage.ErrCorruptBlock`, never silently treated as a miss
+  or a wrong value.
+- **Manifest** (`manifest.go`) — an append-only ADD/DEL log of which
+  SSTable files are currently live (the LevelDB-style approach), so a
+  crash mid-compaction leaves an unambiguous, recoverable trail instead of
+  a directory listing to guess from.
+- **Compaction** (`compaction.go`) — size-tiered, running on its own
+  background goroutine so it never blocks the write path: once a tier
+  accumulates 4 SSTables they're merged into one table at the next tier,
+  cascading if that push also fills the next tier. A tombstone is dropped
+  from the merged output only once no older tier survives beneath it —
+  otherwise a stale value in an older table could "resurrect" after the
+  delete that was shadowing it is gone.
+- **`Store`** (`store.go`) — ties it together: `Open`, `Get`, `Put`,
+  `Delete`, `Close`, plus crash recovery (replay any leftover WAL,
+  immediately flush it back to a fresh SSTable, clean up orphaned SSTable
+  files with no matching manifest record).
+
+### Running tests
+
+```bash
+go build ./...
+go vet ./...
+go test ./storage/... -race
+```
+
+Verbose, so each test name/scenario is visible:
+
+```bash
+go test ./storage/... -race -v
+```
+
+Repeat many times to catch timing-dependent bugs in the background
+flush/compaction goroutines (what M2's own verification actually used
+before being called done — 15 repeats, all clean):
+
+```bash
+go test ./storage/... -race -count=15
+```
+
+Run just one scenario group by name:
+
+```bash
+go test ./storage/... -race -run TestStoreCrashRecovery -v   # crash mid-write, restart, WAL replay
+go test ./storage/... -race -run TestStoreCompaction -v      # size-tiered merge + tombstone GC
+go test ./storage/... -race -run TestSSTableCorruptBlock -v  # checksum corruption is reported, not swallowed
+```
+
+| Test file | Covers |
+|---|---|
+| `wal_test.go` | Append/replay round trip, missing file, a truncated ("torn") final record |
+| `memtable_test.go` | Basic ops, ascending iteration order, size accounting, concurrent access |
+| `sstable_test.go` | Multi-block round trip, tombstones, enforced ascending key order, `ErrCorruptBlock` on a flipped byte |
+| `store_test.go` | End-to-end: basic Get/Put/Delete, tombstone surviving a flush, crash recovery (clean and torn-WAL), compaction + tombstone GC, concurrent Get/Put/Delete |
+
+### Benchmarks
+
+`store_bench_test.go` measures whether concurrent writers scale, to check
+whether `WAL.Append`'s fsync-while-holding-the-lock (`wal.go:60-71`, no
+group commit / write batching) is a real bottleneck rather than a
+theoretical one.
+
+**Important**: these benchmarks deliberately do **not** use `b.TempDir()`.
+That resolves under `os.TempDir()`, which on many machines (this one
+included) is a `tmpfs` mount — an in-RAM filesystem where `fsync` is
+nearly free (~2µs), which would silently produce meaningless, far-too-fast
+numbers for exactly the thing being measured. They write into the
+project's own `tmp/` instead (gitignored, see `benchDir` in
+`store_bench_test.go`) — confirm it's on a real disk before trusting any
+number out of these:
+
+```bash
+df -T tmp/
+```
+
+Raw WAL append throughput under concurrent callers:
+
+```bash
+go test ./storage/... -bench=BenchmarkWALAppendParallel -run=^$ -benchtime=1000x -cpu=1,2,4,8,16
+```
+
+End-to-end `Store.Put` (same WAL cost, plus the memtable insert). Uses a
+huge flush threshold so no flush runs during the benchmark — which means
+the memtable's sorted slice (`memtable.go`) grows for the whole run and
+every insert is O(current size); **always pass a fixed `-benchtime=Nx`**
+here, never the default time-based auto-scaling, or the auto-scaler keeps
+doubling `b.N` into an O(n²) memtable and the run never converges:
+
+```bash
+go test ./storage/... -bench=BenchmarkStorePutParallel -run=^$ -benchtime=1000x -cpu=1,2,4,8,16
+```
+
+Tune value size same as the engine benchmarks:
+
+```bash
+go test ./storage/... -bench=. -run=^$ -benchtime=1000x -valuesize=256 -cpu=1,16
+```
+
+**Measured** (Intel i7-11700, `tmp/` on ext4/NVMe, `-benchtime=1000x`):
+
+| GOMAXPROCS | `BenchmarkWALAppendParallel` | `BenchmarkStorePutParallel` |
+|---|---|---|
+| 1 | 512061 ns/op | 511575 ns/op |
+| 2 | 511157 ns/op | — |
+| 4 | 509327 ns/op | 503139 ns/op |
+| 8 | 498404 ns/op | — |
+| 16 | 504074 ns/op | 507086 ns/op |
+
+ns/op stays flat (~500-512µs) all the way from 1 to 16 concurrent
+goroutines — the signature of a fully serialized bottleneck: if the work
+scaled with cores, per-op time would drop as GOMAXPROCS rises, and it
+doesn't, at all. Total system throughput is capped at ~1950 ops/sec
+(1s / 512µs) regardless of how many goroutines call `Put` concurrently,
+confirming `WAL.Append`'s lack of group commit is a real bottleneck, not
+just a theoretical one.
 
 ## Verifying the build
 
