@@ -23,13 +23,14 @@ project.
 ```
 mini-kv/
 ├── engine/        # M1 — in-memory KV engine (done, see below)
-├── storage/       # M2 — WAL + LSM (not implemented yet)
+├── storage/       # M2 — WAL + LSM (done, see below)
 ├── raft/          # M3 — Raft consensus (not implemented yet)
 ├── transport/     # M4 — gRPC service wrapping raft/engine/storage (not implemented yet)
 ├── cmd/
-│   ├── server/    # M4 — server process (placeholder)
-│   ├── client/    # M4 — client CLI (placeholder)
-│   └── enginecli/ # manual debug REPL for engine.Engine, not part of the M0–M8 chain
+│   ├── server/     # M4 — server process (placeholder)
+│   ├── client/     # M4 — client CLI (placeholder)
+│   ├── enginecli/  # manual debug REPL for engine.Engine, not part of the M0–M8 chain
+│   └── storagecli/ # manual debug REPL for storage.Store, not part of the M0–M8 chain
 ├── simharness/    # MIT 6.824/6.5840-style test rig (fake network, fake
 │                  # persister, N-peer config) — its own Go module, used
 │                  # via go.work, its go.mod is not modified
@@ -202,6 +203,10 @@ under `storage/`, backed by a real on-disk write path:
 - **WAL** (`wal.go`) — every `Put`/`Delete` is appended and fsynced before
   `Store` touches the memtable or returns to the caller, so an
   acknowledged write survives a crash even before it's ever flushed.
+  Uses group commit: concurrent callers batch into one shared `fsync`
+  instead of each paying for their own — measured ~12x throughput at 16
+  concurrent goroutines vs. a plain per-call mutex+fsync (see
+  Benchmarks below).
 - **Memtable** (`memtable.go`) — a mutex-guarded sorted slice (binary
   search), not a skip list: writes are already serialized behind the WAL's
   fsync, so a skip list's lock-free-insert advantage doesn't apply here,
@@ -226,6 +231,29 @@ under `storage/`, backed by a real on-disk write path:
   `Delete`, `Close`, plus crash recovery (replay any leftover WAL,
   immediately flush it back to a fresh SSTable, clean up orphaned SSTable
   files with no matching manifest record).
+
+### Manual REPL (`cmd/storagecli`)
+
+A throwaway REPL for poking at a real `storage.Store` by hand — same idea
+as `cmd/enginecli` for M1, except data here is **real, disk-backed, and
+survives between runs** (that's the whole point of M2):
+
+```bash
+go run ./cmd/storagecli
+> put hello world
+OK
+> get hello
+"world"
+> quit
+```
+
+Run it again (same default `-dir`, or pass your own) with no `put` at
+all — `get hello` still returns `"world"`, recovered from the WAL/SSTable
+files the previous run left on disk. Kill it with Ctrl+C instead of
+`quit` to simulate a real crash (nothing is lost either way — every
+`Put`/`Delete` is WAL-fsynced before it returns). Pass `-flushthreshold=1`
+to force a flush after every single `put`/`delete` and watch
+`sst-*.sst`/`MANIFEST` files appear live in `-dir` as you type.
 
 ### Running tests
 
@@ -266,10 +294,12 @@ go test ./storage/... -race -run TestSSTableCorruptBlock -v  # checksum corrupti
 
 ### Benchmarks
 
-`store_bench_test.go` measures whether concurrent writers scale, to check
-whether `WAL.Append`'s fsync-while-holding-the-lock (`wal.go:60-71`, no
-group commit / write batching) is a real bottleneck rather than a
-theoretical one.
+`store_bench_test.go` measures whether concurrent writers scale.
+`WAL.Append` does **group commit** (`wal.go:94-128`): a single dedicated
+goroutine owns the WAL file and batches every caller currently waiting to
+be received into one `fsync`, instead of each caller paying for its own.
+These benchmarks are what caught the problem this fixes (see below) and
+what guard against it regressing.
 
 **Important**: these benchmarks deliberately do **not** use `b.TempDir()`.
 That resolves under `os.TempDir()`, which on many machines (this one
@@ -309,21 +339,31 @@ go test ./storage/... -bench=. -run=^$ -benchtime=1000x -valuesize=256 -cpu=1,16
 
 **Measured** (Intel i7-11700, `tmp/` on ext4/NVMe, `-benchtime=1000x`):
 
-| GOMAXPROCS | `BenchmarkWALAppendParallel` | `BenchmarkStorePutParallel` |
-|---|---|---|
-| 1 | 512061 ns/op | 511575 ns/op |
-| 2 | 511157 ns/op | — |
-| 4 | 509327 ns/op | 503139 ns/op |
-| 8 | 498404 ns/op | — |
-| 16 | 504074 ns/op | 507086 ns/op |
+**Before group commit** — a plain `sync.Mutex` around each `Append`'s own
+`Write`+`Sync` — `ns/op` stayed flat (~500-512µs) all the way from 1 to 16
+concurrent goroutines, the signature of a fully serialized bottleneck: if
+the work scaled with cores, per-op time would drop as GOMAXPROCS rises,
+and it didn't, at all. Total throughput was capped at ~1950 ops/sec
+(1s / 512µs) no matter how many goroutines called `Put` concurrently.
 
-ns/op stays flat (~500-512µs) all the way from 1 to 16 concurrent
-goroutines — the signature of a fully serialized bottleneck: if the work
-scaled with cores, per-op time would drop as GOMAXPROCS rises, and it
-doesn't, at all. Total system throughput is capped at ~1950 ops/sec
-(1s / 512µs) regardless of how many goroutines call `Put` concurrently,
-confirming `WAL.Append`'s lack of group commit is a real bottleneck, not
-just a theoretical one.
+**After group commit**:
+
+| GOMAXPROCS | `BenchmarkWALAppendParallel` | `BenchmarkStorePutParallel` | vs. before |
+|---|---|---|---|
+| 1 | 516764 ns/op | 508188 ns/op | ~unchanged (no one to batch with) |
+| 2 | 451828 ns/op | — | 1.13x |
+| 4 | 218602 ns/op | 220983 ns/op | 2.33x |
+| 8 | 96146 ns/op | — | 5.18x |
+| 16 | 41555 ns/op | 51075 ns/op | **12.32x** |
+
+At GOMAXPROCS=1 the numbers are essentially unchanged from before (no
+regression when there's no concurrency to exploit); throughput scales
+close to linearly with GOMAXPROCS beyond that, since fsync's cost is
+roughly fixed regardless of batch size — more concurrent callers means
+bigger batches, spreading that fixed cost over more records. Full
+before/after write-up: [`doc/knowledge.md`](doc/knowledge.md) (Storage
+section); design rationale: [`doc/DECISIONS.md`](doc/DECISIONS.md); code
+walkthrough: [`doc/storage-primer.md`](doc/storage-primer.md) §1.3.
 
 ## Verifying the build
 

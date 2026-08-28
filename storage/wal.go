@@ -20,27 +20,57 @@ const (
 // WAL is an append-only, fsync-before-return log. Store calls Append before
 // touching the memtable and before returning to the caller, so a write is
 // never acknowledged until it is durable on disk.
+//
+// Append does group commit: concurrent callers that arrive while a commit
+// is in flight are batched into the *next* fsync instead of each paying
+// for one of their own. A single dedicated goroutine (commitLoop) owns the
+// file — it's the only thing that ever calls f.Write/f.Sync, so callers
+// never need a lock to serialize file access, only a channel to hand off
+// their record. Measured effect: without this, concurrent Append callers
+// were capped at ~1950 ops/sec flat regardless of GOMAXPROCS (every call
+// paid its own ~510µs fsync, fully serialized) — see
+// BenchmarkWALAppendParallel in store_bench_test.go and doc/knowledge.md.
 type WAL struct {
-	mu sync.Mutex
-	f  *os.File
+	f     *os.File
+	reqCh chan walRequest
+	wg    sync.WaitGroup
 }
 
-// OpenWAL opens (creating if necessary) the WAL file at path for appending.
+// walRequest is one caller's already-encoded record, plus where to deliver
+// the result of the (possibly shared) fsync that ends up covering it.
+type walRequest struct {
+	record []byte
+	done   chan error
+}
+
+// OpenWAL opens (creating if necessary) the WAL file at path for appending
+// and starts its commit-loop goroutine.
 func OpenWAL(path string) (*WAL, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	return &WAL{f: f}, nil
+	w := &WAL{f: f, reqCh: make(chan walRequest)}
+	w.wg.Add(1)
+	go w.commitLoop()
+	return w, nil
 }
 
-// Append writes one record and fsyncs it before returning. On-disk layout:
+// Append encodes one record and hands it to the commit loop, blocking until
+// it (and every other record batched into the same fsync) is durable on
+// disk. On-disk layout:
 //
 //	crc32(4B) | recType(1B) | keyLen(varint) | key | [valLen(varint) | value]
 //
 // The trailing valLen/value pair is only present for recPut; recDel carries
-// no value.
+// no value. Append must not be called after Close.
 func (w *WAL) Append(rt recordType, key string, value []byte) error {
+	done := make(chan error, 1)
+	w.reqCh <- walRequest{record: encodeRecord(rt, key, value), done: done}
+	return <-done
+}
+
+func encodeRecord(rt recordType, key string, value []byte) []byte {
 	var payload bytes.Buffer
 	payload.WriteByte(byte(rt))
 
@@ -55,26 +85,58 @@ func (w *WAL) Append(rt recordType, key string, value []byte) error {
 		payload.Write(value)
 	}
 
-	crc := crc32.ChecksumIEEE(payload.Bytes())
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	var crcBuf [4]byte
-	binary.BigEndian.PutUint32(crcBuf[:], crc)
-	if _, err := w.f.Write(crcBuf[:]); err != nil {
-		return err
-	}
-	if _, err := w.f.Write(payload.Bytes()); err != nil {
-		return err
-	}
-	return w.f.Sync()
+	record := make([]byte, 4+payload.Len())
+	binary.BigEndian.PutUint32(record[:4], crc32.ChecksumIEEE(payload.Bytes()))
+	copy(record[4:], payload.Bytes())
+	return record
 }
 
-// Close closes the underlying file. It does not delete it.
+// commitLoop is the sole goroutine that ever touches w.f. It waits for one
+// request, then — without blocking — pulls in every other request that's
+// *already* waiting to be received, so a burst of concurrent Append calls
+// lands in the same write+fsync round instead of one round each. A caller
+// that arrives a moment too late to join simply becomes the first member
+// of the next round: this naturally pipelines under sustained concurrent
+// load without an explicit batch-size or time-window knob.
+func (w *WAL) commitLoop() {
+	defer w.wg.Done()
+	for req := range w.reqCh {
+		waiters := []chan error{req.done}
+		writeErr := writeRecord(w.f, req.record)
+
+	drain:
+		for writeErr == nil {
+			select {
+			case r, ok := <-w.reqCh:
+				if !ok {
+					break drain
+				}
+				waiters = append(waiters, r.done)
+				writeErr = writeRecord(w.f, r.record)
+			default:
+				break drain
+			}
+		}
+
+		if writeErr == nil {
+			writeErr = w.f.Sync()
+		}
+		for _, ch := range waiters {
+			ch <- writeErr
+		}
+	}
+}
+
+func writeRecord(f *os.File, record []byte) error {
+	_, err := f.Write(record)
+	return err
+}
+
+// Close stops the commit loop and closes the underlying file. It does not
+// delete it. Append must not be called concurrently with, or after, Close.
 func (w *WAL) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	close(w.reqCh)
+	w.wg.Wait()
 	return w.f.Close()
 }
 
