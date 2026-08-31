@@ -1,8 +1,7 @@
 # mini-kv (RaftKV)
 
 A distributed, fault-tolerant key-value store written in Go — a
-from-scratch Raft consensus implementation on top of an LSM-style storage engine. This is a personal
-project. 
+from-scratch Raft consensus implementation on top of an LSM-style storage engine. This is a personal project. 
 
 ## Current status
 
@@ -11,7 +10,7 @@ project.
 | M0 | Project skeleton, module layout, `go.work` | ✅ |
 | M1 | Concurrency-safe in-memory engine | ✅ |
 | M2 | Durable storage layer (WAL + minimal LSM) | ✅ |
-| M3 | Core Raft consensus | ⬜ not started (`raft/`) |
+| M3 | Core Raft consensus | 🚧 in progress — leader election done (`raft/`) |
 | M4 | 3-node cluster wiring over gRPC | ⬜ not started (`transport/`, `cmd/server`, `cmd/client`) |
 | M5 | Fault-tolerance verification | ⬜ |
 | M6 | Minimal observability (metrics/logging) | ⬜ |
@@ -24,7 +23,8 @@ project.
 mini-kv/
 ├── engine/        # M1 — in-memory KV engine (done, see below)
 ├── storage/       # M2 — WAL + LSM (done, see below)
-├── raft/          # M3 — Raft consensus (not implemented yet)
+├── raft/          # M3 — Raft consensus: leader election done, log
+│                  #      replication/persistence/snapshot pending
 ├── transport/     # M4 — gRPC service wrapping raft/engine/storage (not implemented yet)
 ├── cmd/
 │   ├── server/     # M4 — server process (placeholder)
@@ -262,17 +262,57 @@ go test ./storage/... -bench=Memtable -run=^$ -benchmem -mem-writepct=50
 go test ./storage/... -bench=Memtable -run=^$ -benchmem -mem-keyspace=200000 -mem-writepct=50
 ```
 
+## Raft (M3)
+
+A from-scratch Raft consensus implementation, tested through
+`simharness` (an in-process fake network/persister/N-peer test rig —
+its own Go module, see Project layout above). Peers only ever talk
+through a `Call(svcMeth, args, reply) bool`-shaped interface, so the same
+`raft.Raft` logic runs unmodified against the fake network in tests and
+(once M4 wires it up) a real gRPC transport in production.
+
+Current scope is **leader election** only: `RequestVote`, heartbeat-only
+`AppendEntries`, randomized election timeouts, and the term-based checks
+that keep two servers from ever both claiming leadership in the same
+term. Log replication, persistence (`ps.Save`), and snapshotting are the
+next steps of M3 — `Start`/`Snapshot` currently exist only to satisfy the
+harness's peer interface and don't do anything beyond that yet.
+
+- **`raft.go`** — the `Raft` struct's state (mirrors the paper's Figure 2:
+  persistent state on all servers, volatile state on all servers, volatile
+  state on leaders), `Make` (matches `harness.RaftMaker`), the election
+  ticker with a randomized deadline, and the candidate/leader transitions.
+- **`rpc.go`** — `RequestVote`/`AppendEntries` request/reply structs and
+  handlers.
+- **`election_test.go`** — `TestInitialElection`, `TestReElection`.
+
+### Running tests
+
+```bash
+go test ./raft/... -race
+```
+
+Repeat many times to catch timing-dependent election bugs:
+
+```bash
+go test ./raft/... -race -count=20
+```
+
+Run one scenario at a time:
+
+```bash
+go test ./raft/... -race -run TestInitialElection -v
+go test ./raft/... -race -run TestReElection -v
+```
+
+| Test file | Covers |
+|---|---|
+| `election_test.go` | Initial leader election; leader disconnect → re-election; old leader rejoining without disrupting the new one; dropping to a minority (no leader can emerge); quorum restored |
+
 ## Verifying the build
 
 ```bash
 go build ./...
 go vet ./...
 go test ./... -race
-```
-
-Once M3 (Raft) is underway, run tests repeatedly to catch
-timing-dependent bugs:
-
-```bash
-go test ./raft/... -race -count=20
 ```
