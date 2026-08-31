@@ -95,6 +95,7 @@ func Make(peers []*simnet.ClientEnd, me int, ps *persister.Persister, applyCh ch
 		rf.acceptedSeq[i] = -1 // below the first dispatched seq (0), so round 0 isn't rejected as stale
 	}
 	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.readPersist(ps.ReadRaftState())
 	rf.resetElectionDeadline()
 	go rf.ticker()
 	go rf.applier()
@@ -143,6 +144,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
 	index := len(rf.log) - 1
+	rf.persist()
 	rf.broadcastAppendEntries(rf.currentTerm)
 	return index, rf.currentTerm, true
 }
@@ -164,6 +166,7 @@ func (rf *Raft) becomeFollower(term int) {
 	rf.currentTerm = term
 	rf.votedFor = -1
 	rf.state = follower
+	rf.persist()
 }
 
 // ticker drives election timeouts: it never resets a per-server timer,
@@ -185,6 +188,7 @@ func (rf *Raft) startElection() {
 	rf.state = candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
+	rf.persist()
 	rf.resetElectionDeadline()
 
 	term := rf.currentTerm

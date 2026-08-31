@@ -39,10 +39,11 @@ func TestManyElections(t *testing.T) {
 }
 
 // Ported from the MIT 6.5840 lab's TestFigure8Unreliable3C, dropping the
-// crash/restart half of the original (this Raft doesn't persist state yet,
-// so a restart would just lose it — not a bug this test is meant to probe).
-// What's left is still the sharpest tool available for the nextIndex
-// regression flagged in code review: every iteration submits a command to
+// crash/restart half of the original — persist_test.go's TestFigure8
+// already covers that combination (repeated crash-restart against the
+// Figure 8 scenario) without the network unreliability on top. What's left
+// here is still the sharpest tool available for the nextIndex regression
+// flagged in code review: every iteration submits a command to
 // every server concurrently (not just through whichever one cfg.One()
 // happens to find), so multiple AppendEntries rounds to the same peer are
 // routinely in flight together, and after iteration 200 the network starts

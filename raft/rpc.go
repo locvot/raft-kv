@@ -60,6 +60,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && candidateUpToDate {
 		rf.votedFor = args.CandidateId
+		rf.persist()
 		reply.VoteGranted = true
 		rf.resetElectionDeadline()
 		return
@@ -107,16 +108,22 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	// Append, but only truncate the suffix if it actually conflicts —
 	// an out-of-order/duplicate RPC carrying entries we already have must
 	// not discard anything already agreed on past them.
+	logChanged := false
 	for i, e := range args.Entries {
 		idx := args.PrevLogIndex + 1 + i
 		if idx >= len(rf.log) {
 			rf.log = append(rf.log, args.Entries[i:]...)
+			logChanged = true
 			break
 		}
 		if rf.log[idx].Term != e.Term {
 			rf.log = append(rf.log[:idx], args.Entries[i:]...)
+			logChanged = true
 			break
 		}
+	}
+	if logChanged {
+		rf.persist()
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
