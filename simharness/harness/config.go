@@ -361,6 +361,32 @@ func (cfg *Config) StartOn(i int, cmd interface{}) (index int, term int, isLeade
 	return rf.Start(cmd)
 }
 
+// SnapshotOn tells peer i's Raft instance it may discard log entries up
+// through index, the same call a real state-machine layer makes once it
+// has durably captured everything up to that point.
+func (cfg *Config) SnapshotOn(i int, index int, snapshot []byte) {
+	cfg.mu.Lock()
+	rf := cfg.rafts[i]
+	cfg.mu.Unlock()
+	if rf != nil {
+		rf.Snapshot(index, snapshot)
+	}
+}
+
+// RaftStateSize reports how many bytes peer i's persisted Raft state
+// (term/votedFor/log, not the snapshot) currently occupies — use it to
+// confirm compaction actually keeps the persisted log bounded rather than
+// growing forever.
+func (cfg *Config) RaftStateSize(i int) int {
+	cfg.mu.Lock()
+	ps := cfg.saved[i]
+	cfg.mu.Unlock()
+	if ps == nil {
+		return 0
+	}
+	return ps.RaftStateSize()
+}
+
 func (cfg *Config) Cleanup() {
 	for i := 0; i < cfg.n; i++ {
 		cfg.mu.Lock()

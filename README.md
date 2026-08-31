@@ -10,7 +10,7 @@ from-scratch Raft consensus implementation on top of an LSM-style storage engine
 | M0 | Project skeleton, module layout, `go.work` | ✅ |
 | M1 | Concurrency-safe in-memory engine | ✅ |
 | M2 | Durable storage layer (WAL + minimal LSM) | ✅ |
-| M3 | Core Raft consensus | 🚧 in progress — leader election + log replication/commit index done (`raft/`) |
+| M3 | Core Raft consensus | ✅ election + log replication + persistence + snapshot/log compaction (`raft/`) |
 | M4 | 3-node cluster wiring over gRPC | ⬜ not started (`transport/`, `cmd/server`, `cmd/client`) |
 | M5 | Fault-tolerance verification | ⬜ |
 | M6 | Minimal observability (metrics/logging) | ⬜ |
@@ -23,9 +23,8 @@ from-scratch Raft consensus implementation on top of an LSM-style storage engine
 mini-kv/
 ├── engine/        # M1 — in-memory KV engine (done, see below)
 ├── storage/       # M2 — WAL + LSM (done, see below)
-├── raft/          # M3 — Raft consensus: leader election + log
-│                  #      replication/commit index done, persistence/
-│                  #      snapshot pending
+├── raft/          # M3 — Raft consensus: election, log replication,
+│                  #      persistence, and snapshot/log compaction all done
 ├── transport/     # M4 — gRPC service wrapping raft/engine/storage (not implemented yet)
 ├── cmd/
 │   ├── server/     # M4 — server process (placeholder)
@@ -272,30 +271,45 @@ through a `Call(svcMeth, args, reply) bool`-shaped interface, so the same
 `raft.Raft` logic runs unmodified against the fake network in tests and
 (once M4 wires it up) a real gRPC transport in production.
 
-Current scope is **leader election + log replication/commit index**:
-`RequestVote`, `AppendEntries` now actually carries and merges log
-entries (append/truncate only on a real conflict, never on an
-already-matching suffix), randomized election timeouts, and commit-index
-advancement that only commits an entry from the leader's own current term
-directly (Raft §5.4.2 — an older-term entry commits only as a side effect
-of a current-term entry ahead of it committing, never just because it
-reached a majority). Persistence (`ps.Save`) and snapshotting are the next
-steps of M3 — `Snapshot` still exists only to satisfy the harness's peer
-interface.
+All four core pieces of M3 are done: **leader election**, **log
+replication + commit index**, **persistence**, and **snapshot + log
+compaction**. `RequestVote`/`AppendEntries` carry and merge log entries
+(append/truncate only on a real conflict, never on an already-matching
+suffix), election timeouts are randomized, and commit-index advancement
+only commits an entry from the leader's own current term directly (Raft
+§5.4.2 — an older-term entry commits only as a side effect of a
+current-term entry ahead of it committing, never just because it reached
+a majority). `currentTerm`/`votedFor`/`log` are persisted (gob-encoded)
+before any RPC reply that depends on the change they represent goes out,
+so a crash-restart never silently forgets a vote or an accepted entry.
+Once a log entry is safely applied, the layer above Raft can call
+`Snapshot(index, data)` to let Raft discard everything at or before it;
+a follower that fell behind far enough that the leader no longer has the
+entries it needs catches up via the `InstallSnapshot` RPC instead of
+replaying history it no longer has.
 
 - **`raft.go`** — the `Raft` struct's state (mirrors the paper's Figure 2:
   persistent state on all servers, volatile state on all servers, volatile
-  state on leaders), `Make` (matches `harness.RaftMaker`), the election
+  state on leaders, plus the snapshot boundary), `Make` (matches
+  `harness.RaftMaker`, restores persisted state on boot), the election
   ticker with a randomized deadline, candidate/leader transitions,
   `replicateTo`/`broadcastAppendEntries` (per-peer replication with
-  `nextIndex`/`matchIndex` bookkeeping and Figure 2's `ConflictTerm`/
-  `ConflictIndex` backtracking optimization), `advanceCommitIndex`, and the
-  `applier` goroutine that drains newly committed entries onto `applyCh`
-  (woken by a `sync.Cond` rather than sending on the channel from inside a
-  locked RPC handler).
-- **`rpc.go`** — `RequestVote`/`AppendEntries` request/reply structs and
-  handlers, including the follower-side log merge and conflict-info
-  reporting used by the backtracking optimization above.
+  `nextIndex`/`matchIndex` bookkeeping, Figure 2's `ConflictTerm`/
+  `ConflictIndex` backtracking optimization, and falling back to
+  `InstallSnapshot` when a peer needs log entries the leader has already
+  compacted away), `advanceCommitIndex`, and the `applier` goroutine that
+  drains newly committed entries (and any pending snapshot) onto
+  `applyCh` (woken by a `sync.Cond` rather than sending on the channel
+  from inside a locked RPC handler).
+- **`rpc.go`** — `RequestVote`/`AppendEntries`/`InstallSnapshot` request/
+  reply structs and handlers, including the follower-side log merge and
+  conflict-info reporting used by the backtracking optimization above.
+- **`persist.go`** — `persistedState` (the durable subset of a peer's
+  state), `persist`/`persistStateAndSnapshot`/`readPersist`.
+- **`snapshot.go`** — the global-index ⟷ physical-slice-index translation
+  that log compaction requires (`lastLogIndex`/`sliceIndex`/`termAt`), the
+  `Snapshot` entry point, and the leader-side `sendInstallSnapshot`
+  dispatch.
 - **`election_test.go`** — `TestInitialElection`, `TestReElection`.
 - **`agreement_test.go`** — log replication/commit-index tests on a
   reliable network.
@@ -304,6 +318,16 @@ interface.
 - **`chaos_test.go`** — two long-running randomized tests ported from the
   MIT 6.5840 lab's own `raft_test.go`, exercising many more scenarios per
   run than a hand-written test can.
+- **`persist_test.go`** — `TestPersist1/2/3` (crash-restart at various
+  points in the cluster's life) and `TestFigure8` (the same relentless
+  crash/restart workload as `chaos_test.go`, but targeted at Leader
+  Completeness — an old-term entry must never get committed by a later
+  leader just because it once reached a majority).
+- **`snapshot_test.go`** — `TestSnapshotBasic` (compaction keeps persisted
+  state size bounded instead of growing forever), `TestSnapshotInstall`
+  (a follower disconnected long enough that the leader compacts past what
+  it needs must catch up via `InstallSnapshot`), `TestSnapshotInstallCrash`
+  (same, combined with a crash-restart).
 
 ### Running tests
 
@@ -324,6 +348,9 @@ go test ./raft/... -race -run TestInitialElection -v
 go test ./raft/... -race -run TestBackup -v
 go test ./raft/... -race -run TestUnreliable -v
 go test ./raft/... -race -run TestFigure8Unreliable -v
+go test ./raft/... -race -run TestPersist -v
+go test ./raft/... -race -run TestFigure8$ -v
+go test ./raft/... -race -run TestSnapshot -v
 ```
 
 | Test file | Covers |
@@ -332,6 +359,8 @@ go test ./raft/... -race -run TestFigure8Unreliable -v
 | `agreement_test.go` | Basic agreement; committing with a minority disconnected; a fully isolated majority (leader included) makes zero progress; concurrent `Start` calls land on distinct indices; a leader rejoining after being partitioned away reconciles its log; a follower that fell far behind catches up via the conflict-backtracking optimization instead of one entry at a time |
 | `unreliable_test.go` | Same agreement properties again with `SetUnreliable`/`SetLongReordering` |
 | `chaos_test.go` | `TestManyElections` — repeatedly isolates a random minority of a 7-node cluster and checks Election Safety at every step; `TestFigure8Unreliable` — 1000-iteration randomized workload (concurrent submissions to every server, random disconnects/reconnects, long RPC reordering after iteration 200) |
+| `persist_test.go` | `TestPersist1/2/3` — crash-restart at various points (whole cluster, isolated leader, isolated follower) and confirm agreement still converges; `TestFigure8` — 1000 rounds of repeated crash-restart against the Figure 8 scenario, the sharpest test available for Leader Completeness |
+| `snapshot_test.go` | `TestSnapshotBasic` — repeated snapshotting keeps persisted state size bounded and replication keeps working; `TestSnapshotInstall`/`TestSnapshotInstallCrash` — a follower that fell behind past what the leader still keeps logged must catch up via `InstallSnapshot`, with or without a crash-restart along the way |
 
 ## Verifying the build
 

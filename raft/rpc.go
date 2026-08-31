@@ -53,8 +53,8 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	lastLogIndex := len(rf.log) - 1
-	lastLogTerm := rf.log[lastLogIndex].Term
+	lastLogIndex := rf.lastLogIndex()
+	lastLogTerm := rf.termAt(lastLogIndex)
 	candidateUpToDate := args.LastLogTerm > lastLogTerm ||
 		(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
 
@@ -89,16 +89,27 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	rf.state = follower
 	rf.resetElectionDeadline()
 
-	if args.PrevLogIndex >= len(rf.log) {
+	lastLogIndex := rf.lastLogIndex()
+	if args.PrevLogIndex > lastLogIndex {
 		reply.Success = false
-		reply.ConflictIndex = len(rf.log)
+		reply.ConflictIndex = lastLogIndex + 1
 		return
 	}
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex < rf.lastIncludedIndex {
+		// Leader thinks we still need entries at or before our own
+		// snapshot boundary — everything through lastIncludedIndex is
+		// already compacted (and therefore already committed), so just
+		// report how far along we actually are and let the leader retry
+		// with an up-to-date PrevLogIndex, or fall back to InstallSnapshot.
 		reply.Success = false
-		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		reply.ConflictIndex = rf.lastIncludedIndex + 1
+		return
+	}
+	if rf.termAt(args.PrevLogIndex) != args.PrevLogTerm {
+		reply.Success = false
+		reply.ConflictTerm = rf.termAt(args.PrevLogIndex)
 		idx := args.PrevLogIndex
-		for idx > 0 && rf.log[idx-1].Term == reply.ConflictTerm {
+		for idx > rf.lastIncludedIndex && rf.termAt(idx-1) == reply.ConflictTerm {
 			idx--
 		}
 		reply.ConflictIndex = idx
@@ -111,13 +122,13 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	logChanged := false
 	for i, e := range args.Entries {
 		idx := args.PrevLogIndex + 1 + i
-		if idx >= len(rf.log) {
+		if idx > lastLogIndex {
 			rf.log = append(rf.log, args.Entries[i:]...)
 			logChanged = true
 			break
 		}
-		if rf.log[idx].Term != e.Term {
-			rf.log = append(rf.log[:idx], args.Entries[i:]...)
+		if rf.termAt(idx) != e.Term {
+			rf.log = append(rf.log[:rf.sliceIndex(idx)], args.Entries[i:]...)
 			logChanged = true
 			break
 		}
@@ -133,4 +144,66 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	}
 
 	reply.Success = true
+}
+
+// InstallSnapshotArgs / InstallSnapshotReply are the wire structs for
+// Figure 13's InstallSnapshot RPC. Unlike the paper this ships the whole
+// snapshot in one RPC (no Offset/Done chunking) — a deliberate scope cut
+// for this project, not a correctness gap: chunking only matters once a
+// single snapshot is too large to hold in memory or send in one message.
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term > rf.currentTerm {
+		rf.becomeFollower(args.Term)
+	}
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	rf.state = follower
+	rf.resetElectionDeadline()
+
+	if args.LastIncludedIndex <= rf.lastIncludedIndex {
+		return // stale: we already have an equal-or-newer snapshot
+	}
+
+	// Figure 13 step 6: if our log already has this exact entry, keep
+	// whatever follows it — our own log/applier will catch up to it
+	// through the normal per-command path, no need to force-feed the
+	// state machine a whole snapshot it's already past.
+	matched := args.LastIncludedIndex <= rf.lastLogIndex() &&
+		rf.termAt(args.LastIncludedIndex) == args.LastIncludedTerm
+
+	if matched {
+		rf.log = append([]LogEntry{{Term: args.LastIncludedTerm}}, rf.log[rf.sliceIndex(args.LastIncludedIndex)+1:]...)
+	} else {
+		rf.log = []LogEntry{{Term: args.LastIncludedTerm}}
+		if rf.lastApplied < args.LastIncludedIndex {
+			rf.lastApplied = args.LastIncludedIndex
+			rf.pendingSnapshot = &pendingSnapshot{index: args.LastIncludedIndex, term: args.LastIncludedTerm, data: args.Data}
+		}
+	}
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+	if rf.commitIndex < args.LastIncludedIndex {
+		rf.commitIndex = args.LastIncludedIndex
+	}
+
+	rf.persistStateAndSnapshot(args.Data)
+	rf.applyCond.Broadcast()
 }

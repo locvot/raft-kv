@@ -48,6 +48,13 @@ type Raft struct {
 	votedFor    int
 	log         []LogEntry
 
+	// persistent state for the snapshot boundary — see snapshot.go's doc
+	// comment for how these shift rf.log's indexing. Zero/zero means "no
+	// snapshot yet," which is also what a peer that has never snapshotted
+	// looks like after readPersist restores nothing.
+	lastIncludedIndex int
+	lastIncludedTerm  int
+
 	state            state
 	electionDeadline time.Time
 
@@ -55,6 +62,10 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 	applyCond   *sync.Cond // signaled whenever commitIndex advances or rf is killed
+
+	// pendingSnapshot is non-nil when InstallSnapshot has updated rf's log
+	// but applier hasn't yet delivered the snapshot to the state machine.
+	pendingSnapshot *pendingSnapshot
 
 	// volatile state on leaders
 	nextIndex  []int
@@ -96,6 +107,11 @@ func Make(peers []*simnet.ClientEnd, me int, ps *persister.Persister, applyCh ch
 	}
 	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.readPersist(ps.ReadRaftState())
+	// Anything at or before lastIncludedIndex is covered by the snapshot;
+	// the service layer is expected to load it from ps.ReadSnapshot()
+	// itself rather than have Raft redeliver it over applyCh.
+	rf.lastApplied = rf.lastIncludedIndex
+	rf.commitIndex = rf.lastIncludedIndex
 	rf.resetElectionDeadline()
 	go rf.ticker()
 	go rf.applier()
@@ -143,13 +159,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, rf.currentTerm, false
 	}
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
-	index := len(rf.log) - 1
+	index := rf.lastLogIndex()
 	rf.persist()
 	rf.broadcastAppendEntries(rf.currentTerm)
 	return index, rf.currentTerm, true
 }
-
-func (rf *Raft) Snapshot(index int, snapshot []byte) {}
 
 // resetElectionDeadline picks a fresh randomized deadline. Must be called
 // with rf.mu held. Randomization spreads deadlines apart so one election
@@ -192,8 +206,8 @@ func (rf *Raft) startElection() {
 	rf.resetElectionDeadline()
 
 	term := rf.currentTerm
-	lastLogIndex := len(rf.log) - 1
-	lastLogTerm := rf.log[lastLogIndex].Term
+	lastLogIndex := rf.lastLogIndex()
+	lastLogTerm := rf.termAt(lastLogIndex)
 	votes := 1
 
 	for i := range rf.peers {
@@ -235,7 +249,7 @@ func (rf *Raft) becomeLeader() {
 		return
 	}
 	rf.state = leader
-	lastLogIndex := len(rf.log) - 1
+	lastLogIndex := rf.lastLogIndex()
 	for i := range rf.peers {
 		rf.nextIndex[i] = lastLogIndex + 1
 		rf.matchIndex[i] = 0
@@ -289,8 +303,14 @@ func (rf *Raft) replicateTo(i int, term int) {
 		return
 	}
 	prevLogIndex := rf.nextIndex[i] - 1
-	prevLogTerm := rf.log[prevLogIndex].Term
-	entries := append([]LogEntry(nil), rf.log[prevLogIndex+1:]...)
+	if prevLogIndex < rf.lastIncludedIndex {
+		// The entry this peer needs next was already compacted out of our
+		// log — only a snapshot has it anymore.
+		rf.sendInstallSnapshot(i, term)
+		return
+	}
+	prevLogTerm := rf.termAt(prevLogIndex)
+	entries := append([]LogEntry(nil), rf.log[rf.sliceIndex(prevLogIndex)+1:]...)
 	args := AppendEntriesArgs{
 		Term:         term,
 		LeaderId:     rf.me,
@@ -377,8 +397,8 @@ func (rf *Raft) replicateTo(i int, term int) {
 // that never saw it get committed can still overwrite it, which is exactly
 // what TestFigure8 in the persistence milestone will probe for.
 func (rf *Raft) advanceCommitIndex() {
-	for n := len(rf.log) - 1; n > rf.commitIndex; n-- {
-		if rf.log[n].Term != rf.currentTerm {
+	for n := rf.lastLogIndex(); n > rf.commitIndex; n-- {
+		if rf.termAt(n) != rf.currentTerm {
 			continue
 		}
 		count := 1 // rf.me always has entry n in its own log
@@ -404,12 +424,26 @@ func (rf *Raft) applier() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	for !rf.killed() {
+		if rf.pendingSnapshot != nil {
+			snap := rf.pendingSnapshot
+			rf.pendingSnapshot = nil
+			msg := harness.ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      snap.data,
+				SnapshotTerm:  snap.term,
+				SnapshotIndex: snap.index,
+			}
+			rf.mu.Unlock()
+			rf.applyCh <- msg
+			rf.mu.Lock()
+			continue
+		}
 		if rf.lastApplied >= rf.commitIndex {
 			rf.applyCond.Wait()
 			continue
 		}
 		rf.lastApplied++
-		entry := rf.log[rf.lastApplied]
+		entry := rf.log[rf.sliceIndex(rf.lastApplied)]
 		msg := harness.ApplyMsg{
 			CommandValid: true,
 			Command:      entry.Command,
