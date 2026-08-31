@@ -10,7 +10,7 @@ from-scratch Raft consensus implementation on top of an LSM-style storage engine
 | M0 | Project skeleton, module layout, `go.work` | ✅ |
 | M1 | Concurrency-safe in-memory engine | ✅ |
 | M2 | Durable storage layer (WAL + minimal LSM) | ✅ |
-| M3 | Core Raft consensus | 🚧 in progress — leader election done (`raft/`) |
+| M3 | Core Raft consensus | 🚧 in progress — leader election + log replication/commit index done (`raft/`) |
 | M4 | 3-node cluster wiring over gRPC | ⬜ not started (`transport/`, `cmd/server`, `cmd/client`) |
 | M5 | Fault-tolerance verification | ⬜ |
 | M6 | Minimal observability (metrics/logging) | ⬜ |
@@ -23,8 +23,9 @@ from-scratch Raft consensus implementation on top of an LSM-style storage engine
 mini-kv/
 ├── engine/        # M1 — in-memory KV engine (done, see below)
 ├── storage/       # M2 — WAL + LSM (done, see below)
-├── raft/          # M3 — Raft consensus: leader election done, log
-│                  #      replication/persistence/snapshot pending
+├── raft/          # M3 — Raft consensus: leader election + log
+│                  #      replication/commit index done, persistence/
+│                  #      snapshot pending
 ├── transport/     # M4 — gRPC service wrapping raft/engine/storage (not implemented yet)
 ├── cmd/
 │   ├── server/     # M4 — server process (placeholder)
@@ -271,20 +272,38 @@ through a `Call(svcMeth, args, reply) bool`-shaped interface, so the same
 `raft.Raft` logic runs unmodified against the fake network in tests and
 (once M4 wires it up) a real gRPC transport in production.
 
-Current scope is **leader election** only: `RequestVote`, heartbeat-only
-`AppendEntries`, randomized election timeouts, and the term-based checks
-that keep two servers from ever both claiming leadership in the same
-term. Log replication, persistence (`ps.Save`), and snapshotting are the
-next steps of M3 — `Start`/`Snapshot` currently exist only to satisfy the
-harness's peer interface and don't do anything beyond that yet.
+Current scope is **leader election + log replication/commit index**:
+`RequestVote`, `AppendEntries` now actually carries and merges log
+entries (append/truncate only on a real conflict, never on an
+already-matching suffix), randomized election timeouts, and commit-index
+advancement that only commits an entry from the leader's own current term
+directly (Raft §5.4.2 — an older-term entry commits only as a side effect
+of a current-term entry ahead of it committing, never just because it
+reached a majority). Persistence (`ps.Save`) and snapshotting are the next
+steps of M3 — `Snapshot` still exists only to satisfy the harness's peer
+interface.
 
 - **`raft.go`** — the `Raft` struct's state (mirrors the paper's Figure 2:
   persistent state on all servers, volatile state on all servers, volatile
   state on leaders), `Make` (matches `harness.RaftMaker`), the election
-  ticker with a randomized deadline, and the candidate/leader transitions.
+  ticker with a randomized deadline, candidate/leader transitions,
+  `replicateTo`/`broadcastAppendEntries` (per-peer replication with
+  `nextIndex`/`matchIndex` bookkeeping and Figure 2's `ConflictTerm`/
+  `ConflictIndex` backtracking optimization), `advanceCommitIndex`, and the
+  `applier` goroutine that drains newly committed entries onto `applyCh`
+  (woken by a `sync.Cond` rather than sending on the channel from inside a
+  locked RPC handler).
 - **`rpc.go`** — `RequestVote`/`AppendEntries` request/reply structs and
-  handlers.
+  handlers, including the follower-side log merge and conflict-info
+  reporting used by the backtracking optimization above.
 - **`election_test.go`** — `TestInitialElection`, `TestReElection`.
+- **`agreement_test.go`** — log replication/commit-index tests on a
+  reliable network.
+- **`unreliable_test.go`** — the same kind of properties again with the
+  network dropping/delaying/reordering RPCs.
+- **`chaos_test.go`** — two long-running randomized tests ported from the
+  MIT 6.5840 lab's own `raft_test.go`, exercising many more scenarios per
+  run than a hand-written test can.
 
 ### Running tests
 
@@ -292,7 +311,7 @@ harness's peer interface and don't do anything beyond that yet.
 go test ./raft/... -race
 ```
 
-Repeat many times to catch timing-dependent election bugs:
+Repeat many times to catch timing-dependent bugs:
 
 ```bash
 go test ./raft/... -race -count=20
@@ -302,12 +321,17 @@ Run one scenario at a time:
 
 ```bash
 go test ./raft/... -race -run TestInitialElection -v
-go test ./raft/... -race -run TestReElection -v
+go test ./raft/... -race -run TestBackup -v
+go test ./raft/... -race -run TestUnreliable -v
+go test ./raft/... -race -run TestFigure8Unreliable -v
 ```
 
 | Test file | Covers |
 |---|---|
 | `election_test.go` | Initial leader election; leader disconnect → re-election; old leader rejoining without disrupting the new one; dropping to a minority (no leader can emerge); quorum restored |
+| `agreement_test.go` | Basic agreement; committing with a minority disconnected; a fully isolated majority (leader included) makes zero progress; concurrent `Start` calls land on distinct indices; a leader rejoining after being partitioned away reconciles its log; a follower that fell far behind catches up via the conflict-backtracking optimization instead of one entry at a time |
+| `unreliable_test.go` | Same agreement properties again with `SetUnreliable`/`SetLongReordering` |
+| `chaos_test.go` | `TestManyElections` — repeatedly isolates a random minority of a 7-node cluster and checks Election Safety at every step; `TestFigure8Unreliable` — 1000-iteration randomized workload (concurrent submissions to every server, random disconnects/reconnects, long RPC reordering after iteration 200) |
 
 ## Verifying the build
 

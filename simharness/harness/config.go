@@ -338,6 +338,29 @@ func (cfg *Config) RPCCount() int            { return cfg.net.RPCCount() }
 func (cfg *Config) SetUnreliable(u bool)     { cfg.net.Reliable(!u) }
 func (cfg *Config) SetLongReordering(v bool) { cfg.net.LongReordering(v) }
 
+// IsConnected reports whether peer i is currently attached to the network —
+// use it to decide whether a peer that just accepted a Start() is the one
+// actually reachable by a majority, not merely a partitioned-off leader
+// that hasn't yet noticed.
+func (cfg *Config) IsConnected(i int) bool {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+	return cfg.connected[i]
+}
+
+// StartOn submits cmd directly through peer i, bypassing leader discovery.
+// Chaos-style tests submit to every server every round (since they don't
+// know which one is leader) rather than routing through One().
+func (cfg *Config) StartOn(i int, cmd interface{}) (index int, term int, isLeader bool) {
+	cfg.mu.Lock()
+	rf := cfg.rafts[i]
+	cfg.mu.Unlock()
+	if rf == nil {
+		return -1, -1, false
+	}
+	return rf.Start(cmd)
+}
+
 func (cfg *Config) Cleanup() {
 	for i := 0; i < cfg.n; i++ {
 		cfg.mu.Lock()
