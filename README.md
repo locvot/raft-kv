@@ -14,7 +14,7 @@ from-scratch Raft consensus implementation on top of an LSM-style storage engine
 | M4 | 3-node cluster wiring over gRPC | ✅ real gRPC transport, leader redirect, `cmd/server`/`cmd/client` (`transport/`) |
 | M5 | Fault-tolerance verification | ✅ leader-kill + node-isolation demo against real processes (`scripts/fault_tolerance_demo.sh`), `transport/server_test.go` |
 | M6 | Minimal observability (metrics/logging) | ✅ Prometheus metrics endpoint per node, structured `log/slog` logging (`metrics/`, `transport/`, `cmd/server`) |
-| M7 | Real benchmarks & write-up | ⬜ |
+| M7 | Real benchmarks & write-up | ✅ real p50/p99/throughput via `cmd/loadgen` (1-node vs 3-node), `engine` bench (sharded vs single-mutex), write amplification via `cmd/wabench` — see [Benchmarks](#benchmarks-m7) below |
 | M8 | Finished README, architecture, design doc | ⬜ |
 
 ## Project layout
@@ -31,7 +31,9 @@ mini-kv/
 │   ├── client/         # client CLI: get/put/delete against a cluster
 │   ├── clusterstatus/  # M5: probes every peer's leader/follower state
 │   ├── enginecli/      # manual debug REPL for engine.Engine
-│   └── storagecli/     # manual debug REPL for storage.Store
+│   ├── storagecli/     # manual debug REPL for storage.Store
+│   ├── loadgen/        # M7: real p50/p99/throughput load generator
+│   └── wabench/        # M7: real storage write-amplification measurement
 ├── scripts/
 │   └── fault_tolerance_demo.sh # M5: kill-leader + isolate-node demo
 └── simharness/    # MIT 6.824/6.5840-style test rig (fake network, fake
@@ -84,6 +86,25 @@ mini-kv/
   (as the in-process test clusters in `transport/server_test.go` do)
   without colliding. Logging across `cmd/server` and `transport/` uses
   structured `log/slog`, tagged with the node index.
+- **Benchmarks (M7)** — `cmd/loadgen` is a real load generator: N
+  concurrent simulated clients, each its own `transport.Client`, driving
+  a real cluster over gRPC and reporting real p50/p90/p99 latency and
+  throughput. `cmd/wabench` measures `storage.Store`'s real write
+  amplification (physical bytes written, from `/proc/self/io`, divided by
+  logical bytes the caller asked to write) across a range of value sizes.
+  Running `cmd/loadgen` against a real 1-node cluster for the M7 "1-node
+  vs 3-node" comparison surfaced two real bugs in `raft/raft.go`, both
+  now fixed: `startElection`'s `RequestVote` fan-out loop skips `rf.me`,
+  so with a single peer it runs zero times and the majority check that
+  normally lives inside each vote reply's handler never ran, even though
+  a lone self-vote is already a majority of one; and even after fixing
+  that, `advanceCommitIndex` (the only thing that ever advances
+  `commitIndex`) was only ever called from a `replicateTo` reply handler,
+  which also never fires with zero peers to reply — so a 1-node leader
+  got elected but then hung forever on every write. Both fixes are exact
+  no-ops for N>1 (verified with `go test ./raft/... -race -count=3` and
+  the full suite, no regressions). All real numbers below came from a
+  real run, not an estimate.
 
 ## Build, test, run
 
@@ -124,3 +145,64 @@ own clusters):
 ```bash
 scripts/fault_tolerance_demo.sh
 ```
+
+## Benchmarks (M7)
+
+All numbers below came from a real run, not an estimate. Machine: Intel
+Core i7-11700 @ 2.50GHz (8C/16T), 31GiB RAM, NVMe/ext4 disk (not tmpfs —
+fsync cost is the whole point of the write-amplification numbers below,
+so it has to hit a real disk), Linux 7.1.8.
+
+```bash
+go run ./cmd/loadgen -peers=localhost:9001,localhost:9002,localhost:9003 -clients=50 -duration=15s
+go run ./cmd/wabench -valuesize=4096
+```
+
+**Sharded vs single-mutex** (`go test ./engine/... -bench=. -benchmem -keyspace=100000 -valuesize=256 -writepct=50 -cpu=1,4,16`):
+
+| Engine | 1 CPU | 4 CPU | 16 CPU |
+|---|---|---|---|
+| MutexMap | 162 ns/op | 168 ns/op | 220 ns/op |
+| ShardedMap | 172 ns/op | 63.8 ns/op | **35.3 ns/op (6.2× MutexMap)** |
+| SyncMap | 309 ns/op | 83.9 ns/op | 51.5 ns/op |
+| RWMutexMap | 190 ns/op | 229 ns/op | 237 ns/op |
+| RCUShardedMap | 8843 ns/op | 2102 ns/op | 1214 ns/op |
+
+MutexMap gets *slower* under more CPUs (single-mutex contention, 50%
+writes); ShardedMap scales near-linearly.
+
+**1-node vs 3-node**, real gRPC cluster, 50 concurrent clients, 15s,
+10k-key keyspace, 128B values, 50% Put/50% Get:
+
+| Cluster | Throughput | p50 | p90 | p99 |
+|---|---|---|---|---|
+| 1 node | 605 ops/s | 26.8 ms | 197 ms | 239 ms |
+| 3 node | 480 ops/s | 114 ms | 238 ms | 281 ms |
+
+Single-client (uncontended) latency floor: 1 node p50 4.2ms, 3 node p50
+8.3ms. The gap between that floor and the 50-client p50 is queueing
+delay in front of `transport.Server.applyLoop`'s single-goroutine,
+one-fsync-per-write apply path (confirmed via the leader's own
+`raftkv_request_duration_seconds` metric in the same run: Put averaged
+139ms, Get — which skips the log entirely — averaged 7.4ms), not Raft's
+own RPC round trip: the single-client floor already goes through the
+same replication path and stays under 10ms. Not fixed in M7's scope
+(measure and report, not optimize) — the natural fix would be batching
+several already-committed entries into one write/fsync in `applyLoop`
+(group commit at the apply layer, not just inside `WAL.Append` as today),
+not attempted here for lack of evidence it's needed at this project's
+scale.
+
+**Write amplification vs value size** (`cmd/wabench`, 20k Puts over a
+1k-key keyspace — each key overwritten ~20×, 256KiB flush threshold):
+
+| Value size | Write amplification |
+|---|---|
+| 64 B | 58.9× |
+| 1 KiB | 6.68× |
+| 4 KiB | 4.72× |
+| 16 KiB | 5.00× |
+
+Amplification does **not** increase with value size — the M2 stretch
+goal's trigger condition for value separation (WiscKey/Badger-style) is
+not met by real measurement, so it stays out of scope.

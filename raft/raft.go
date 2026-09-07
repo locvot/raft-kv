@@ -161,6 +161,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
 	index := rf.lastLogIndex()
 	rf.persist()
+	// In a single-node cluster (len(rf.peers) == 1) the entry just appended
+	// to the leader's own log is already on a majority by itself — but
+	// nothing else ever calls advanceCommitIndex for it: broadcastAppendEntries
+	// below has zero peers to replicate to, and advanceCommitIndex otherwise
+	// only runs from a replicateTo reply handler, which never fires with no
+	// peers to reply. Without this call a 1-node cluster elects a leader
+	// (see becomeLeader/startElection) but every write then hangs forever,
+	// never applied — found by M7's real 1-node loadgen run. For N>1 this is
+	// a no-op: the entry can't be on a majority yet from rf.me's vote alone.
+	rf.advanceCommitIndex()
 	rf.broadcastAppendEntries(rf.currentTerm)
 	return index, rf.currentTerm, true
 }
@@ -209,6 +219,18 @@ func (rf *Raft) startElection() {
 	lastLogIndex := rf.lastLogIndex()
 	lastLogTerm := rf.termAt(lastLogIndex)
 	votes := 1
+
+	// A single-node cluster's self-vote is already a majority (1*2 > 1) —
+	// found by M7's real 1-node loadgen run, which never elected a leader
+	// without this: the RequestVote fan-out loop below has zero peers to
+	// iterate over when rf.peers has length 1, so the majority check that
+	// normally happens inside each vote reply's handler never ran. For
+	// every N>1 this check is a no-op (1*2 > N is false), so it changes
+	// nothing about the N>1 case's timing or behavior.
+	if votes*2 > len(rf.peers) {
+		rf.becomeLeader()
+		return
+	}
 
 	for i := range rf.peers {
 		if i == rf.me {
