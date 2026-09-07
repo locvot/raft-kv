@@ -3,39 +3,25 @@
 A distributed, fault-tolerant key-value store written in Go — a
 from-scratch Raft consensus implementation on top of an LSM-style storage engine. This is a personal project.
 
-## Current status
-
-| Milestone | Scope | Status |
-|---|---|---|
-| M0 | Project skeleton, module layout, `go.work` | ✅ |
-| M1 | Concurrency-safe in-memory engine | ✅ |
-| M2 | Durable storage layer (WAL + minimal LSM) | ✅ |
-| M3 | Core Raft consensus | ✅ election + log replication + persistence + snapshot/log compaction (`raft/`) |
-| M4 | 3-node cluster wiring over gRPC | ✅ real gRPC transport, leader redirect, `cmd/server`/`cmd/client` (`transport/`) |
-| M5 | Fault-tolerance verification | ✅ leader-kill + node-isolation demo against real processes (`scripts/fault_tolerance_demo.sh`), `transport/server_test.go` |
-| M6 | Minimal observability (metrics/logging) | ✅ Prometheus metrics endpoint per node, structured `log/slog` logging (`metrics/`, `transport/`, `cmd/server`) |
-| M7 | Real benchmarks & write-up | ✅ real p50/p99/throughput via `cmd/loadgen` (1-node vs 3-node), `engine` bench (sharded vs single-mutex), write amplification via `cmd/wabench` — see [Benchmarks](#benchmarks-m7) below |
-| M8 | Finished README, architecture, design doc | ⬜ |
-
 ## Project layout
 
 ```
 mini-kv/
-├── engine/        # M1 — in-memory KV engine
-├── storage/       # M2 — WAL + LSM
-├── raft/          # M3 — Raft consensus
-├── transport/     # M4 — gRPC service wrapping raft/storage
-├── metrics/       # M6 — Prometheus collectors, one private registry per node
+├── engine/        # in-memory KV engine
+├── storage/       # WAL + LSM
+├── raft/          # Raft consensus
+├── transport/     # gRPC service wrapping raft/storage
+├── metrics/       # Prometheus collectors, one private registry per node
 ├── cmd/
 │   ├── server/         # server process: flags -peers/-me/-dir/-metrics-addr
 │   ├── client/         # client CLI: get/put/delete against a cluster
-│   ├── clusterstatus/  # M5: probes every peer's leader/follower state
+│   ├── clusterstatus/  # probes every peer's leader/follower state
 │   ├── enginecli/      # manual debug REPL for engine.Engine
 │   ├── storagecli/     # manual debug REPL for storage.Store
-│   ├── loadgen/        # M7: real p50/p99/throughput load generator
-│   └── wabench/        # M7: real storage write-amplification measurement
+│   ├── loadgen/        # real p50/p99/throughput load generator
+│   └── wabench/        # real storage write-amplification measurement
 ├── scripts/
-│   └── fault_tolerance_demo.sh # M5: kill-leader + isolate-node demo
+│   └── fault_tolerance_demo.sh # kill-leader + isolate-node demo
 └── simharness/    # MIT 6.824/6.5840-style test rig (fake network, fake
                    # persister, N-peer config) — its own Go module, used
                    # via go.work, its go.mod is not modified
@@ -43,27 +29,27 @@ mini-kv/
 
 ## Modules
 
-- **Engine (M1)** — `engine.Engine` is a minimal `Get/Put/Delete`
+- **Engine** — `engine.Engine` is a minimal `Get/Put/Delete`
   interface with explicit copy semantics. Five implementations
   (`MutexMap`, `ShardedMap`, `RWMutexMap`, `SyncMap`, `RCUShardedMap`)
   compare different concurrency-control strategies over the same
   interface.
-- **Storage (M2)** — `storage.Store` is a durable, LSM-style key-value
+- **Storage** — `storage.Store` is a durable, LSM-style key-value
   engine: a group-commit WAL, a skip-list memtable, immutable checksummed
   SSTables, an append-only manifest, and background size-tiered
   compaction.
-- **Raft (M3)** — a from-scratch Raft implementation covering leader
+- **Raft** — a from-scratch Raft implementation covering leader
   election, log replication with the Figure 2 conflict-backtracking
   optimization, persistence, and snapshot/log compaction with
   `InstallSnapshot`. Tested through `simharness`, an in-process fake
   network/persister test rig.
-- **Transport (M4)** — wires `raft.Raft` and `storage.Store` into a real
+- **Transport** — wires `raft.Raft` and `storage.Store` into a real
   multi-process cluster over gRPC (`raftkvpb/`), with leader redirect on
   the client side. Peer membership is static, set at startup via `-peers`.
   Known gap: Raft's own persistent state still uses the in-memory
   `simharness` persister, so it does not survive a real process restart —
   only `storage.Store`'s data is durable across restarts today.
-- **Fault tolerance (M5)** — `transport/server_test.go` has two
+- **Fault tolerance** — `transport/server_test.go` has two
   fault-injection tests: killing the leader mid-write, and isolating one
   follower via `transport.Server.SetPartitioned`, a network-partition
   simulation built entirely at the application layer (no root/iptables
@@ -74,7 +60,7 @@ mini-kv/
   `cmd/server` processes over real loopback gRPC and prints a transcript
   proving the cluster elects a new leader and keeps accepting writes, and
   that an isolated minority-of-one never declares itself leader.
-- **Observability (M6)** — each node serves its own Prometheus metrics at
+- **Observability** — each node serves its own Prometheus metrics at
   `-metrics-addr` (default `localhost:9101+me`) `/metrics`: a
   `raftkv_request_duration_seconds` histogram and a
   `raftkv_requests_total{op,result}` counter for every Get/Put/Delete
@@ -86,13 +72,13 @@ mini-kv/
   (as the in-process test clusters in `transport/server_test.go` do)
   without colliding. Logging across `cmd/server` and `transport/` uses
   structured `log/slog`, tagged with the node index.
-- **Benchmarks (M7)** — `cmd/loadgen` is a real load generator: N
+- **Benchmarks** — `cmd/loadgen` is a real load generator: N
   concurrent simulated clients, each its own `transport.Client`, driving
   a real cluster over gRPC and reporting real p50/p90/p99 latency and
   throughput. `cmd/wabench` measures `storage.Store`'s real write
   amplification (physical bytes written, from `/proc/self/io`, divided by
   logical bytes the caller asked to write) across a range of value sizes.
-  Running `cmd/loadgen` against a real 1-node cluster for the M7 "1-node
+  Running `cmd/loadgen` against a real 1-node cluster for the "1-node
   vs 3-node" comparison surfaced two real bugs in `raft/raft.go`, both
   now fixed: `startElection`'s `RequestVote` fan-out loop skips `rf.me`,
   so with a single peer it runs zero times and the majority check that
@@ -105,6 +91,63 @@ mini-kv/
   no-ops for N>1 (verified with `go test ./raft/... -race -count=3` and
   the full suite, no regressions). All real numbers below came from a
   real run, not an estimate.
+
+## Architecture
+
+One node, showing every layer a request crosses. All three nodes run the
+identical binary (`cmd/server`); which one is "the leader" changes at
+runtime via Raft election, not at deploy time.
+
+```mermaid
+flowchart TB
+    client["cmd/client\n(or any gRPC caller)"]
+
+    subgraph node["transport.Server (one OS process)"]
+        kv["KV gRPC service\nGet / Put / Delete\n(transport/kv_service.go)"]
+        raftinternal["RaftInternal gRPC service\nRequestVote / AppendEntries /\nInstallSnapshot\n(transport/raft_service.go)"]
+        rf["raft.Raft\nleader election, log replication,\npersistence, snapshotting\n(raft/)"]
+        apply["applyLoop\n(applyCh consumer)"]
+        store["storage.Store\nWAL + memtable + SSTables\n(storage/)"]
+        metrics["metrics.Metrics\n/metrics (Prometheus)"]
+    end
+
+    peers[["other 2 transport.Server\nprocesses (same shape)"]]
+
+    client -- "Get/Put/Delete\n(gRPC)" --> kv
+    kv -- "not leader:\nredirect to known leader" --> client
+    kv -- "leader: rf.Start(cmd)" --> rf
+    rf <-- "RequestVote/AppendEntries/\nInstallSnapshot (gRPC)" --> raftinternal
+    raftinternal <-. "same RPCs over the network" .-> peers
+    rf -- "committed entries" --> apply
+    apply -- "sequential applies" --> store
+    store -- "value / ok" --> kv
+    kv -.-> metrics
+```
+
+**Request flow for a `Put`** (the path measured in
+[Benchmarks](#benchmarks)):
+
+1. Client sends `Put` over gRPC to whichever node it's configured with.
+2. If that node isn't the Raft leader, it rejects with the last known
+   leader's address (`transport/kv_service.go`); the client retries there.
+3. The leader calls `raft.Raft.Start`, which appends the command to its
+   local log and returns immediately — it does not block for
+   replication.
+4. `raft.Raft` replicates the entry to followers via `AppendEntries`
+   RPCs (`raft/rpc.go` client side, `transport/raft_service.go` +
+   `raft_forwarder.go` server side); once a majority (including the
+   leader) has durably persisted it, the leader advances `commitIndex`.
+5. The committed entry is delivered on `applyCh`; the server's
+   `applyLoop` (`transport/server.go`) applies it to `storage.Store` in
+   log order — this is the single-goroutine, one-fsync-per-write
+   serialization point identified as the throughput ceiling in the
+   benchmarks below.
+6. The original RPC handler, which has been waiting on that log index,
+   returns the result to the client.
+
+A `Get` skips steps 3–4 today (read-through-leader, no lease reads — see
+[Transport](#modules)), which is why its measured latency is much
+lower than `Put`'s.
 
 ## Build, test, run
 
@@ -146,7 +189,7 @@ own clusters):
 scripts/fault_tolerance_demo.sh
 ```
 
-## Benchmarks (M7)
+## Benchmarks
 
 All numbers below came from a real run, not an estimate. Machine: Intel
 Core i7-11700 @ 2.50GHz (8C/16T), 31GiB RAM, NVMe/ext4 disk (not tmpfs —
@@ -186,7 +229,7 @@ one-fsync-per-write apply path (confirmed via the leader's own
 `raftkv_request_duration_seconds` metric in the same run: Put averaged
 139ms, Get — which skips the log entirely — averaged 7.4ms), not Raft's
 own RPC round trip: the single-client floor already goes through the
-same replication path and stays under 10ms. Not fixed in M7's scope
+same replication path and stays under 10ms. Not fixed here
 (measure and report, not optimize) — the natural fix would be batching
 several already-committed entries into one write/fsync in `applyLoop`
 (group commit at the apply layer, not just inside `WAL.Append` as today),
@@ -203,6 +246,6 @@ scale.
 | 4 KiB | 4.72× |
 | 16 KiB | 5.00× |
 
-Amplification does **not** increase with value size — the M2 stretch
-goal's trigger condition for value separation (WiscKey/Badger-style) is
-not met by real measurement, so it stays out of scope.
+Amplification does **not** increase with value size — the trigger
+condition for value separation (WiscKey/Badger-style) is not met by real
+measurement, so it stays out of scope.
