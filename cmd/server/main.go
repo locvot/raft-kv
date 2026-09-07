@@ -7,6 +7,13 @@
 //	go run ./cmd/server -me=0   # in one terminal
 //	go run ./cmd/server -me=1   # in another
 //	go run ./cmd/server -me=2   # and another
+//
+// SIGUSR1 toggles transport.Server.SetPartitioned on this node — M5's
+// fault-injection primitive (see doc/DECISIONS.md) for simulating a
+// network partition of this one process without root/iptables:
+//
+//	kill -USR1 <pid>   # first: partition this node from every peer
+//	kill -USR1 <pid>   # second: heal it back
 package main
 
 import (
@@ -59,6 +66,17 @@ func main() {
 		<-sig
 		log.Printf("server: shutting down")
 		srv.Close()
+	}()
+
+	partitionSig := make(chan os.Signal, 1)
+	signal.Notify(partitionSig, syscall.SIGUSR1)
+	go func() {
+		partitioned := false
+		for range partitionSig {
+			partitioned = !partitioned
+			srv.SetPartitioned(partitioned)
+			log.Printf("server: node %d partitioned=%v", *me, partitioned)
+		}
 	}()
 
 	log.Printf("server: node %d listening on %s, peers=%v, dir=%s", *me, peers[*me], peers, *dir)

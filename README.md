@@ -12,7 +12,7 @@ from-scratch Raft consensus implementation on top of an LSM-style storage engine
 | M2 | Durable storage layer (WAL + minimal LSM) | ✅ |
 | M3 | Core Raft consensus | ✅ election + log replication + persistence + snapshot/log compaction (`raft/`) |
 | M4 | 3-node cluster wiring over gRPC | ✅ real gRPC transport, leader redirect, `cmd/server`/`cmd/client` (`transport/`) |
-| M5 | Fault-tolerance verification | ⬜ |
+| M5 | Fault-tolerance verification | ✅ leader-kill + node-isolation demo against real processes (`scripts/fault_tolerance_demo.sh`), `transport/server_test.go` |
 | M6 | Minimal observability (metrics/logging) | ⬜ |
 | M7 | Real benchmarks & write-up | ⬜ |
 | M8 | Finished README, architecture, design doc | ⬜ |
@@ -26,10 +26,13 @@ mini-kv/
 ├── raft/          # M3 — Raft consensus
 ├── transport/     # M4 — gRPC service wrapping raft/storage
 ├── cmd/
-│   ├── server/     # server process: flags -peers/-me/-dir
-│   ├── client/     # client CLI: get/put/delete against a cluster
-│   ├── enginecli/  # manual debug REPL for engine.Engine
-│   └── storagecli/ # manual debug REPL for storage.Store
+│   ├── server/         # server process: flags -peers/-me/-dir
+│   ├── client/         # client CLI: get/put/delete against a cluster
+│   ├── clusterstatus/  # M5: probes every peer's leader/follower state
+│   ├── enginecli/      # manual debug REPL for engine.Engine
+│   └── storagecli/     # manual debug REPL for storage.Store
+├── scripts/
+│   └── fault_tolerance_demo.sh # M5: kill-leader + isolate-node demo
 └── simharness/    # MIT 6.824/6.5840-style test rig (fake network, fake
                    # persister, N-peer config) — its own Go module, used
                    # via go.work, its go.mod is not modified
@@ -57,6 +60,17 @@ mini-kv/
   Known gap: Raft's own persistent state still uses the in-memory
   `simharness` persister, so it does not survive a real process restart —
   only `storage.Store`'s data is durable across restarts today.
+- **Fault tolerance (M5)** — `transport/server_test.go` has two
+  fault-injection tests: killing the leader mid-write, and isolating one
+  follower via `transport.Server.SetPartitioned`, a network-partition
+  simulation built entirely at the application layer (no root/iptables
+  needed): it disables that node's own outbound Raft RPC ends and makes
+  its inbound RaftInternal handlers refuse, in both directions, while its
+  election/heartbeat ticker keeps running underneath.
+  `scripts/fault_tolerance_demo.sh` runs both scenarios against three real
+  `cmd/server` processes over real loopback gRPC and prints a transcript
+  proving the cluster elects a new leader and keeps accepting writes, and
+  that an isolated minority-of-one never declares itself leader.
 
 ## Build, test, run
 
@@ -80,4 +94,13 @@ go run ./cmd/client
 OK
 > get hello
 "world"
+```
+
+Watch fault tolerance in action — kill the leader mid-write, isolate a
+node, and confirm the cluster keeps working — against three real
+processes (no manual setup needed, the script starts and tears down its
+own clusters):
+
+```bash
+scripts/fault_tolerance_demo.sh
 ```

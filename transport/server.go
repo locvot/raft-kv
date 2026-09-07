@@ -84,9 +84,13 @@ type Server struct {
 
 	conns []*grpc.ClientConn // index-aligned with cfg.Peers; nil at cfg.Me
 
+	netw        *simnet.Network // this node's own outbound Raft RPC network, see SetPartitioned
+	outEndNames []string        // index-aligned with cfg.Peers; "" at cfg.Me
+
 	mu          sync.Mutex
 	waiters     map[int]waiter
-	knownLeader int // index into cfg.Peers naming who last proved itself leader to us, or -1
+	knownLeader int  // index into cfg.Peers naming who last proved itself leader to us, or -1
+	partitioned bool // see SetPartitioned
 
 	closed     chan struct{}
 	closeOnce  sync.Once
@@ -119,11 +123,14 @@ func NewServer(cfg Config) (*Server, error) {
 
 	rn := simnet.MakeNetwork()
 	peerEnds := make([]*simnet.ClientEnd, len(cfg.Peers))
+	outEndNames := make([]string, len(cfg.Peers))
 	for j, addr := range cfg.Peers {
-		peerEnds[j] = rn.MakeEnd(fmt.Sprintf("out-%d", j))
+		endName := fmt.Sprintf("out-%d", j)
+		peerEnds[j] = rn.MakeEnd(endName)
 		if j == cfg.Me {
 			continue // raft.go never calls peers[me] — see broadcastAppendEntries/startElection
 		}
+		outEndNames[j] = endName
 		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			store.Close()
@@ -135,8 +142,10 @@ func NewServer(cfg Config) (*Server, error) {
 		srv.AddService(simnet.MakeService(newRaftForwarder(conn)))
 		serverName := fmt.Sprintf("peer-%d", j)
 		rn.AddServer(serverName, srv)
-		rn.Connect(fmt.Sprintf("out-%d", j), serverName)
+		rn.Connect(endName, serverName)
 	}
+	s.netw = rn
+	s.outEndNames = outEndNames
 
 	ps := persister.MakePersister()
 	raftPeer := raft.Make(peerEnds, cfg.Me, ps, s.applyCh)
@@ -277,4 +286,39 @@ func (s *Server) leaderHint() string {
 		return ""
 	}
 	return s.cfg.Peers[id]
+}
+
+// SetPartitioned simulates cutting this node off from every other Raft
+// peer, in both directions, without touching the OS network — M5's
+// fault-injection primitive (see doc/DECISIONS.md, "Fault-tolerance
+// verification (M5)") for when neither a real network partition (needs
+// root for iptables/nft) nor a proxy like toxiproxy is available.
+//
+// Outbound: disables every one of this node's own simnet.ClientEnd
+// entries, the same mechanism simharness's own Config.Disconnect uses in
+// tests — raft.go's peers[j].Call(...) starts returning false immediately,
+// exactly as if the peer were unreachable.
+// Inbound: raft_service.go's RequestVote/AppendEntries/InstallSnapshot
+// handlers check isPartitioned and refuse before touching s.rf, so a
+// partitioned node's ticker keeps running (it can still start elections
+// and increment its term) but every RPC in or out is dropped — the
+// property M5 needs to demonstrate a lone partitioned node never
+// accumulates a majority of votes.
+func (s *Server) SetPartitioned(p bool) {
+	s.mu.Lock()
+	s.partitioned = p
+	s.mu.Unlock()
+	for j, name := range s.outEndNames {
+		if j == s.cfg.Me {
+			continue
+		}
+		s.netw.Enable(name, !p)
+	}
+}
+
+// isPartitioned reports the state SetPartitioned last set.
+func (s *Server) isPartitioned() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.partitioned
 }
