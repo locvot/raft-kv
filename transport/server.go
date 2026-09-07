@@ -17,13 +17,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/locvth/mini-kv/metrics"
 	"github.com/locvth/mini-kv/raft"
 	"github.com/locvth/mini-kv/storage"
 	"github.com/locvth/mini-kv/transport/raftkvpb"
@@ -82,6 +85,9 @@ type Server struct {
 	store   *storage.Store
 	applyCh chan harness.ApplyMsg
 
+	metrics *metrics.Metrics
+	log     *slog.Logger
+
 	conns []*grpc.ClientConn // index-aligned with cfg.Peers; nil at cfg.Me
 
 	netw        *simnet.Network // this node's own outbound Raft RPC network, see SetPartitioned
@@ -119,7 +125,17 @@ func NewServer(cfg Config) (*Server, error) {
 		waiters:     make(map[int]waiter),
 		knownLeader: -1,
 		closed:      make(chan struct{}),
+		metrics:     metrics.New(),
+		log:         slog.Default().With("node", cfg.Me),
 	}
+	s.metrics.SetKeyCountFunc(func() float64 {
+		n, err := store.KeyCount()
+		if err != nil {
+			s.log.Warn("key count scrape failed", "error", err)
+			return -1
+		}
+		return float64(n)
+	})
 
 	rn := simnet.MakeNetwork()
 	peerEnds := make([]*simnet.ClientEnd, len(cfg.Peers))
@@ -160,13 +176,29 @@ func NewServer(cfg Config) (*Server, error) {
 	return s, nil
 }
 
+// MetricsHandler serves this node's Prometheus metrics in text exposition
+// format — mount it wherever the caller wants (cmd/server puts it at
+// "/metrics" on a separate listener from the gRPC one).
+func (s *Server) MetricsHandler() http.Handler {
+	return s.metrics.Handler()
+}
+
 // Serve starts the gRPC server on lis and blocks until it stops (via
-// Close, or a listener error).
+// Close, or a listener error). s.grpcServer is written under s.mu (and
+// read the same way in Close) rather than left bare: nothing forces
+// Serve's goroutine to have run yet when a fast, immediate Close (e.g. a
+// test that asserts on Server state without ever driving real cluster
+// traffic first) reads s.grpcServer — -race caught exactly that window
+// once a test was fast enough to hit it, turning this from a theoretical
+// race into a confirmed one.
 func (s *Server) Serve(lis net.Listener) error {
-	s.grpcServer = grpc.NewServer()
-	raftkvpb.RegisterRaftInternalServer(s.grpcServer, s)
-	raftkvpb.RegisterKVServer(s.grpcServer, s)
-	return s.grpcServer.Serve(lis)
+	grpcServer := grpc.NewServer()
+	raftkvpb.RegisterRaftInternalServer(grpcServer, s)
+	raftkvpb.RegisterKVServer(grpcServer, s)
+	s.mu.Lock()
+	s.grpcServer = grpcServer
+	s.mu.Unlock()
+	return grpcServer.Serve(lis)
 }
 
 // Close stops serving, tears down the Raft peer and its dialed peer
@@ -175,8 +207,11 @@ func (s *Server) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
 		close(s.closed)
-		if s.grpcServer != nil {
-			s.grpcServer.GracefulStop()
+		s.mu.Lock()
+		grpcServer := s.grpcServer
+		s.mu.Unlock()
+		if grpcServer != nil {
+			grpcServer.GracefulStop()
 		}
 		s.rf.Kill()
 		for _, c := range s.conns {
@@ -230,6 +265,14 @@ func (s *Server) handleApply(msg harness.ApplyMsg) {
 	}
 	s.mu.Unlock()
 	if !ok {
+		// No local RPC handler is waiting on this index — either this node
+		// is a follower applying an entry no client ever asked it directly,
+		// or the waiter already gave up (awaitApply timed out). Either way,
+		// applyErr would otherwise vanish with nobody to report it to; log
+		// it so a real storage failure on the apply path is never silent.
+		if applyErr != nil {
+			s.log.Error("apply failed with no waiter", "index", msg.CommandIndex, "op", cmd.Op, "error", applyErr)
+		}
 		return
 	}
 	if w.term != msg.CommandTerm {

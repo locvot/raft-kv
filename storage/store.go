@@ -416,6 +416,46 @@ func (s *Store) Err() error {
 	return s.err
 }
 
+// KeyCount returns the number of live (non-tombstone) keys currently
+// visible across the memtable and every SSTable, deduplicated by key with
+// the newest write winning — the same merge `mergeTables` does for
+// compaction, just counting instead of writing a new table. This loads
+// every entry in the store into memory, the same cost as a full
+// compaction pass; acceptable for periodic metrics collection at this
+// project's scale (see metrics.Metrics.SetKeyCountFunc), not meant to be
+// called from any request path.
+func (s *Store) KeyCount() (int, error) {
+	s.mu.RLock()
+	mem := s.mem
+	handles := append([]*sstHandle(nil), s.sstables...) // newest-first, same order as Get
+	s.mu.RUnlock()
+
+	seen := make(map[string]bool)
+	live := 0
+	mem.Iterate(func(key string, value []byte, tombstone bool) {
+		seen[key] = true
+		if !tombstone {
+			live++
+		}
+	})
+	for _, h := range handles {
+		entries, err := h.reader.readAllEntries()
+		if err != nil {
+			return 0, err
+		}
+		for _, e := range entries {
+			if seen[e.key] {
+				continue
+			}
+			seen[e.key] = true
+			if !e.tombstone {
+				live++
+			}
+		}
+	}
+	return live, nil
+}
+
 // Close stops the background compaction goroutine, waits for it and any
 // in-flight flush to finish, then closes the active WAL, every open
 // SSTable reader, and the manifest.

@@ -13,7 +13,7 @@ from-scratch Raft consensus implementation on top of an LSM-style storage engine
 | M3 | Core Raft consensus | ✅ election + log replication + persistence + snapshot/log compaction (`raft/`) |
 | M4 | 3-node cluster wiring over gRPC | ✅ real gRPC transport, leader redirect, `cmd/server`/`cmd/client` (`transport/`) |
 | M5 | Fault-tolerance verification | ✅ leader-kill + node-isolation demo against real processes (`scripts/fault_tolerance_demo.sh`), `transport/server_test.go` |
-| M6 | Minimal observability (metrics/logging) | ⬜ |
+| M6 | Minimal observability (metrics/logging) | ✅ Prometheus metrics endpoint per node, structured `log/slog` logging (`metrics/`, `transport/`, `cmd/server`) |
 | M7 | Real benchmarks & write-up | ⬜ |
 | M8 | Finished README, architecture, design doc | ⬜ |
 
@@ -25,8 +25,9 @@ mini-kv/
 ├── storage/       # M2 — WAL + LSM
 ├── raft/          # M3 — Raft consensus
 ├── transport/     # M4 — gRPC service wrapping raft/storage
+├── metrics/       # M6 — Prometheus collectors, one private registry per node
 ├── cmd/
-│   ├── server/         # server process: flags -peers/-me/-dir
+│   ├── server/         # server process: flags -peers/-me/-dir/-metrics-addr
 │   ├── client/         # client CLI: get/put/delete against a cluster
 │   ├── clusterstatus/  # M5: probes every peer's leader/follower state
 │   ├── enginecli/      # manual debug REPL for engine.Engine
@@ -71,6 +72,18 @@ mini-kv/
   `cmd/server` processes over real loopback gRPC and prints a transcript
   proving the cluster elects a new leader and keeps accepting writes, and
   that an isolated minority-of-one never declares itself leader.
+- **Observability (M6)** — each node serves its own Prometheus metrics at
+  `-metrics-addr` (default `localhost:9101+me`) `/metrics`: a
+  `raftkv_request_duration_seconds` histogram and a
+  `raftkv_requests_total{op,result}` counter for every Get/Put/Delete
+  (`result` is `ok`, `not_leader`, or `error` — enough for p50/p99
+  latency, throughput, and error rate via PromQL), plus a `raftkv_keys`
+  gauge for the number of live keys currently stored. `metrics.Metrics`
+  registers on a private `prometheus.Registry` per node rather than the
+  global one, so multiple `transport.Server`s can coexist in one process
+  (as the in-process test clusters in `transport/server_test.go` do)
+  without colliding. Logging across `cmd/server` and `transport/` uses
+  structured `log/slog`, tagged with the node index.
 
 ## Build, test, run
 
@@ -94,6 +107,13 @@ go run ./cmd/client
 OK
 > get hello
 "world"
+```
+
+Scrape a node's metrics (node 0's default `-metrics-addr` is
+`localhost:9101`):
+
+```bash
+curl localhost:9101/metrics
 ```
 
 Watch fault tolerance in action — kill the leader mid-write, isolate a

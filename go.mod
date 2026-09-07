@@ -8,6 +8,7 @@ require (
 )
 
 require (
+	github.com/prometheus/client_golang v1.23.2 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect

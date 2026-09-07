@@ -256,6 +256,57 @@ func TestStoreCompactionMergesAndDropsTombstones(t *testing.T) {
 	}
 }
 
+// TestStoreKeyCount exercises every dedup path KeyCount has to get right:
+// a key living only in the memtable, a key overwritten across a flush
+// (older SSTable value must not double-count), and a key deleted after
+// being flushed (tombstone in a newer table must suppress the live
+// count, not just shadow Get). flushThreshold=1 means every Put/Delete
+// flushes immediately — the flush is triggered synchronously but runs on
+// a background goroutine, so each write below waits for its own flush
+// before KeyCount reads, otherwise it can race a memtable the flush has
+// already swapped out for an empty one before the old one's data ever
+// reaches an SSTable.
+func TestStoreKeyCount(t *testing.T) {
+	s := mustOpen(t, testDir(t), 1)
+
+	if err := s.Put("mem-only", []byte("v")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if !s.waitForFlush(testFlushTimeout) {
+		t.Fatal("flush after Put did not complete in time")
+	}
+	if n, err := s.KeyCount(); err != nil || n != 1 {
+		t.Fatalf("KeyCount() = (%d, %v), want (1, nil)", n, err)
+	}
+
+	if err := s.Put("flushed", []byte("v1")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if !s.waitForFlush(testFlushTimeout) {
+		t.Fatal("flush after Put did not complete in time")
+	}
+	if err := s.Put("flushed", []byte("v2")); err != nil {
+		t.Fatalf("Put overwrite: %v", err)
+	}
+	if !s.waitForFlush(testFlushTimeout) {
+		t.Fatal("flush after overwrite did not complete in time")
+	}
+
+	if n, err := s.KeyCount(); err != nil || n != 2 {
+		t.Fatalf("KeyCount() after overwrite = (%d, %v), want (2, nil) — overwrite must not double-count", n, err)
+	}
+
+	if err := s.Delete("flushed"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if !s.waitForFlush(testFlushTimeout) {
+		t.Fatal("flush after Delete did not complete in time")
+	}
+	if n, err := s.KeyCount(); err != nil || n != 1 {
+		t.Fatalf("KeyCount() after delete = (%d, %v), want (1, nil) — tombstone must exclude the key", n, err)
+	}
+}
+
 func TestStoreConcurrent(t *testing.T) {
 	s := mustOpen(t, testDir(t), 512)
 

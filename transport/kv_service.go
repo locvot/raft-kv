@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"time"
 
 	"github.com/locvth/mini-kv/transport/raftkvpb"
 )
@@ -23,39 +24,59 @@ import (
 // the ability to commit anything new.
 
 func (s *Server) Get(ctx context.Context, req *raftkvpb.GetRequest) (*raftkvpb.GetResponse, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { s.metrics.ObserveRequest("get", result, time.Since(start)) }()
+
 	if _, isLeader := s.rf.GetState(); !isLeader {
+		result = "not_leader"
 		return &raftkvpb.GetResponse{NotLeader: true, LeaderHint: s.leaderHint()}, nil
 	}
 	value, ok, err := s.store.Get(req.Key)
 	if err != nil {
+		result = "error"
 		return nil, err
 	}
 	return &raftkvpb.GetResponse{Value: value, Ok: ok}, nil
 }
 
 func (s *Server) Put(ctx context.Context, req *raftkvpb.PutRequest) (*raftkvpb.PutResponse, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { s.metrics.ObserveRequest("put", result, time.Since(start)) }()
+
 	index, term, isLeader := s.rf.Start(Command{Op: opPut, Key: req.Key, Value: req.Value})
 	if !isLeader {
+		result = "not_leader"
 		return &raftkvpb.PutResponse{NotLeader: true, LeaderHint: s.leaderHint()}, nil
 	}
 	if err := s.awaitApply(ctx, index, term); err != nil {
 		if err == errNotLeader {
+			result = "not_leader"
 			return &raftkvpb.PutResponse{NotLeader: true, LeaderHint: s.leaderHint()}, nil
 		}
+		result = "error"
 		return nil, err
 	}
 	return &raftkvpb.PutResponse{}, nil
 }
 
 func (s *Server) Delete(ctx context.Context, req *raftkvpb.DeleteRequest) (*raftkvpb.DeleteResponse, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { s.metrics.ObserveRequest("delete", result, time.Since(start)) }()
+
 	index, term, isLeader := s.rf.Start(Command{Op: opDelete, Key: req.Key})
 	if !isLeader {
+		result = "not_leader"
 		return &raftkvpb.DeleteResponse{NotLeader: true, LeaderHint: s.leaderHint()}, nil
 	}
 	if err := s.awaitApply(ctx, index, term); err != nil {
 		if err == errNotLeader {
+			result = "not_leader"
 			return &raftkvpb.DeleteResponse{NotLeader: true, LeaderHint: s.leaderHint()}, nil
 		}
+		result = "error"
 		return nil, err
 	}
 	return &raftkvpb.DeleteResponse{}, nil
